@@ -367,48 +367,7 @@ app.post("/webhook/asaas", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// ENDEREÇOS
-// ════════════════════════════════════════════════════════════════════════════
-app.get("/api/enderecos/:phone", async (req, res) => {
-  const { data } = await supabase.from("addresses").select("*").eq("user_phone", decodeURIComponent(req.params.phone)).order("created_at");
-  res.json({ addresses: data || [] });
-});
-
-app.post("/api/enderecos", async (req, res) => {
-  const { phone, label, street, city, cep } = req.body;
-  if (!phone || !label || !street) return res.status(400).json({ error: "phone, label e street são obrigatórios" });
-  const { data } = await supabase.from("addresses").insert({ user_phone:phone, label, street, city, cep }).select().single();
-  log("ENDEREÇO SALVO", { phone, label });
-  res.json({ address: data });
-});
-
-app.delete("/api/enderecos/:id", async (req, res) => {
-  await supabase.from("addresses").delete().eq("id", req.params.id);
-  res.json({ ok: true });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// CARTÕES
-// ════════════════════════════════════════════════════════════════════════════
-app.get("/api/cartoes/:phone", async (req, res) => {
-  const { data } = await supabase.from("cards").select("*").eq("user_phone", decodeURIComponent(req.params.phone)).order("created_at");
-  res.json({ cards: data || [] });
-});
-
-app.post("/api/cartoes", async (req, res) => {
-  const { phone, label, last4, brand, type } = req.body;
-  if (!phone || !label || !last4) return res.status(400).json({ error: "phone, label e last4 são obrigatórios" });
-  const { data } = await supabase.from("cards").insert({ user_phone:phone, label, last4, brand, type }).select().single();
-  log("CARTÃO SALVO", { phone, brand, last4 });
-  res.json({ card: data });
-});
-
-app.delete("/api/cartoes/:id", async (req, res) => {
-  await supabase.from("cards").delete().eq("id", req.params.id);
-  res.json({ ok: true });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
+// Admin — Lista usuários (protegido por adminKey)
 // ════════════════════════════════════════════════════════════════════════════
 app.get("/api/admin/usuarios", async (req, res) => {
   if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
