@@ -395,3 +395,56 @@ app.listen(PORT, () => {
 ╚═══════════════════════════════════════════════════════╝
   `);
 });
+
+// AUTH — Cadastro
+app.post("/api/auth/cadastro", async (req, res) => {
+  const { name, email, password, role } = req.body;
+  if (!name || !email || !password || !role)
+    return res.status(400).json({ error: "name, email, password e role são obrigatórios" });
+  try {
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email, password, email_confirm: true,
+      user_metadata: { name, role },
+    });
+    if (authError) {
+      if (authError.message.includes("already registered"))
+        return res.status(409).json({ error: "E-mail já cadastrado. Faça login." });
+      throw authError;
+    }
+    const firstName = name.trim().split(" ")[0];
+    await supabase.from("users").upsert({ email, name: firstName, full_name: name, role, auth_id: authData.user.id, is_pro: false }, { onConflict: "email" });
+    log("CADASTRO", { email, role });
+    res.json({ ok: true, user: { id: authData.user.id, name: firstName, email, role, isPro: role === "professional" } });
+  } catch (e) {
+    log("ERRO cadastro", e.message);
+    res.status(500).json({ error: e.message || "Erro ao criar conta" });
+  }
+});
+
+// AUTH — Login
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: "email e password são obrigatórios" });
+  try {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
+    const { data: profile } = await supabase.from("users").select("*").eq("email", email).single();
+    log("LOGIN", { email });
+    res.json({ ok: true, token: data.session.access_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: profile?.is_pro || false } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// AUTH — Recuperar Senha
+app.post("/api/auth/recuperar-senha", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email é obrigatório" });
+  try {
+    await supabase.auth.resetPasswordForEmail(email, { redirectTo: "https://multifuncao.com.br" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
