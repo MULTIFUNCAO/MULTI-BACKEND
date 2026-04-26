@@ -448,3 +448,19 @@ app.post("/api/auth/recuperar-senha", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// AUTH — Redefinir Senha
+app.post("/api/auth/redefinir-senha", async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ error: "token e password são obrigatórios" });
+  try {
+    const { error } = await supabase.auth.admin.updateUserById(
+      (await supabase.auth.getUser(token)).data.user?.id,
+      { password }
+    );
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "Erro ao redefinir senha" });
+  }
+});
