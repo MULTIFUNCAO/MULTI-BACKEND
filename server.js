@@ -487,8 +487,9 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
   if (entry.code !== code) return res.status(400).json({ error: "Codigo incorreto" });
   try {
     const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
-    if (!userData) return res.status(404).json({ error: "Usuario nao encontrado" });
-    const { error } = await supabase.auth.admin.updateUserById(userData.auth_id, { password: newPassword });
+      const authUser = authUsers?.find(u => u.email === email);
+      if (!authUser) return res.status(404).json({ error: "Usuario nao encontrado" });
+      const { error } = await supabase.auth.admin.updateUserById(authUser.id, { password: newPassword });
     if (error) throw error;
     delete resetCodes[email];
     res.json({ ok: true });
