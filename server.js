@@ -464,3 +464,33 @@ app.post("/api/auth/redefinir-senha", async (req, res) => {
     res.status(500).json({ error: e.message || "Erro ao redefinir senha" });
   }
 });
+
+// Reset senha com codigo 6 digitos via SendGrid
+const resetCodes = {};
+
+app.post("/api/auth/solicitar-codigo", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email obrigatorio" });
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  resetCodes[email] = { code, expires: Date.now() + 15 * 60 * 1000 };
+  try {
+    await sgMail.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: "Erro ao enviar email" }); }
+});
+
+app.post("/api/auth/verificar-codigo", async (req, res) => {
+  const { email, code, newPassword } = req.body;
+  const entry = resetCodes[email];
+  if (!entry) return res.status(400).json({ error: "Nenhum codigo solicitado" });
+  if (Date.now() > entry.expires) { delete resetCodes[email]; return res.status(400).json({ error: "Codigo expirado" }); }
+  if (entry.code !== code) return res.status(400).json({ error: "Codigo incorreto" });
+  try {
+    const { data: userData } = await supabase.from("users").select("auth_id").eq("email", email).single();
+    if (!userData) return res.status(404).json({ error: "Usuario nao encontrado" });
+    const { error } = await supabase.auth.admin.updateUserById(userData.auth_id, { password: newPassword });
+    if (error) throw error;
+    delete resetCodes[email];
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
