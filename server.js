@@ -498,8 +498,8 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
 
 // Enderecos
 app.post("/api/enderecos", async (req, res) => {
-  const { user_id, nome, rua, cidade, cep } = req.body;
-  if (!user_id) return res.status(400).json({ error: "user_id obrigatorio" });
+  const { phone, nome, rua, cidade, cep } = req.body; const user_id = phone;
+  if (!phone) return res.status(400).json({ error: "phone obrigatorio" });
   const { data, error } = await supabase.from("enderecos").insert({ user_id, nome, rua, cidade, cep }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -514,7 +514,7 @@ app.get("/api/enderecos/:user_id", async (req, res) => {
 // Cartoes
 app.post("/api/cartoes", async (req, res) => {
   const { user_id, nome, numero, bandeira, tipo } = req.body;
-  if (!user_id) return res.status(400).json({ error: "user_id obrigatorio" });
+  if (!phone) return res.status(400).json({ error: "phone obrigatorio" });
   const { data, error } = await supabase.from("cartoes").insert({ user_id, nome, numero, bandeira, tipo }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
