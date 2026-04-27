@@ -486,7 +486,7 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
   if (Date.now() > entry.expires) { delete resetCodes[email]; return res.status(400).json({ error: "Codigo expirado" }); }
   if (entry.code !== code) return res.status(400).json({ error: "Codigo incorreto" });
   try {
-    const { data: userData } = await supabase.from("users").select("auth_id").eq("email", email).single();
+    const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
     if (!userData) return res.status(404).json({ error: "Usuario nao encontrado" });
     const { error } = await supabase.auth.admin.updateUserById(userData.auth_id, { password: newPassword });
     if (error) throw error;
