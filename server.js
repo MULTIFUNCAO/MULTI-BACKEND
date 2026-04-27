@@ -495,3 +495,33 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// Enderecos
+app.post("/api/enderecos", async (req, res) => {
+  const { user_id, nome, rua, cidade, cep } = req.body;
+  if (!user_id) return res.status(400).json({ error: "user_id obrigatorio" });
+  const { data, error } = await supabase.from("enderecos").insert({ user_id, nome, rua, cidade, cep }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get("/api/enderecos/:user_id", async (req, res) => {
+  const { data, error } = await supabase.from("enderecos").select("*").eq("user_id", req.params.user_id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Cartoes
+app.post("/api/cartoes", async (req, res) => {
+  const { user_id, nome, numero, bandeira, tipo } = req.body;
+  if (!user_id) return res.status(400).json({ error: "user_id obrigatorio" });
+  const { data, error } = await supabase.from("cartoes").insert({ user_id, nome, numero, bandeira, tipo }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get("/api/cartoes/:user_id", async (req, res) => {
+  const { data, error } = await supabase.from("cartoes").select("*").eq("user_id", req.params.user_id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
