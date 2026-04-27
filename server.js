@@ -498,9 +498,9 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
 
 // Enderecos
 app.post("/api/enderecos", async (req, res) => {
-  const { phone, nome, rua, cidade, cep } = req.body; const user_id = phone;
+  const { phone, label, street, city, cep } = req.body; const user_id = phone;
   if (!phone) return res.status(400).json({ error: "phone obrigatorio" });
-  const { data, error } = await supabase.from("enderecos").insert({ user_id, nome, rua, cidade, cep }).select().single();
+  const { data, error } = await supabase.from("enderecos").insert({ user_id: phone, label, street, city, cep }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
