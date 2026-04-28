@@ -525,3 +525,15 @@ app.get("/api/cartoes/:user_id", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
+
+app.delete("/api/enderecos/:id", async (req, res) => {
+  const { error } = await supabase.from("enderecos").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.delete("/api/cartoes/:id", async (req, res) => {
+  const { error } = await supabase.from("cartoes").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
