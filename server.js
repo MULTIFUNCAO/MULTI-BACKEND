@@ -513,7 +513,7 @@ app.get("/api/enderecos/:user_id", async (req, res) => {
 
 // Cartoes
 app.post("/api/cartoes", async (req, res) => {
-  const { user_id, nome, numero, bandeira, tipo } = req.body;
+  const { phone, nome, numero, bandeira, tipo } = req.body; const user_id = phone;
   
   const { data, error } = await supabase.from("cartoes").insert({ user_id, nome, numero, bandeira, tipo }).select().single();
   if (error) return res.status(500).json({ error: error.message });
