@@ -536,7 +536,6 @@ app.put("/api/enderecos/:id", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.delete("/api/enderecos/:id", async (req, res) => {
-app.delete("/api/enderecos/:id", async (req, res) => {
   const { error } = await supabase.from("enderecos").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
