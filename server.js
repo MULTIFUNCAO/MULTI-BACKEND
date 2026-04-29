@@ -245,7 +245,7 @@ app.post("/api/criar-cliente", async (req, res) => {
     } else {
       const { data } = await asaas.post("/customers", {
         name,
-      mobilePhone: phone.replace(/\D/g,"").replace(/^(\d{2})(\d{4,5})(\d{4})$/, "($1) $2-$3"),
+      mobilePhone: (()=>{ const d=phone.replace(/\D/g,""); return "("+d.slice(0,2)+") "+d.slice(2,7)+"-"+d.slice(7); })(),
         email: email || undefined,
       });
       customerId = data.id;
