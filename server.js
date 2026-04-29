@@ -526,6 +526,16 @@ app.get("/api/cartoes/:user_id", async (req, res) => {
   res.json(data);
 });
 
+app.put("/api/enderecos/:id", async (req, res) => {
+  const { id } = req.params;
+  const { label, street, city, cep } = req.body;
+  try {
+    const { data, error } = await supabase.from("enderecos").update({ label, street, city, cep }).eq("id", id).select().single();
+    if (error) throw error;
+    res.json({ address: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/enderecos/:id", async (req, res) => {
 app.delete("/api/enderecos/:id", async (req, res) => {
   const { error } = await supabase.from("enderecos").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
