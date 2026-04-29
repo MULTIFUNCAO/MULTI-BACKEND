@@ -246,6 +246,7 @@ app.post("/api/criar-cliente", async (req, res) => {
       const { data } = await asaas.post("/customers", {
         name,
         email: email || undefined,
+      cpfCnpj: "24971563792",
       });
       customerId = data.id;
     }
