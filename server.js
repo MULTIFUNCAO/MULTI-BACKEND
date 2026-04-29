@@ -272,7 +272,7 @@ app.post("/api/gerar-pix", async (req, res) => {
   try {
     const pay = await asaas.post("/payments", {
       customer: customerId,
-      billingType: "PIX",
+      billingType: "UNDEFINED",
       value: pd.value,
       dueDate: new Date().toISOString().split("T")[0],
       description: `Multi PRO — Plano ${pd.label}`,
