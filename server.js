@@ -237,7 +237,7 @@ app.post("/api/criar-cliente", async (req, res) => {
 
   try {
     // Search in Asaas first
-    const search = await asaas.get(`/customers?mobilePhone=${phone.replace(/\D/g,"")}`);
+    const search = await asaas.get(`/customers?email=${email}`);
     let customerId;
 
     if (search.data.data?.length > 0) {
