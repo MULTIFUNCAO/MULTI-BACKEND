@@ -297,7 +297,7 @@ app.post("/api/gerar-pix", async (req, res) => {
     });
   } catch (e) {
     log("ERRO gerar-pix", e.response?.data || e.message);
-    res.status(500).json({ error: "Erro ao gerar PIX" });
+    res.status(500).json({ error: "Erro ao gerar PIX", detail: e.response?.data || e.message });
   }
 });
 
