@@ -257,7 +257,7 @@ app.post("/api/criar-cliente", async (req, res) => {
     res.json({ customerId });
   } catch (e) {
     log("ERRO criar-cliente", e.response?.data || e.message);
-    res.status(500).json({ error: "Erro ao criar cliente" });
+    res.status(500).json({ error: "Erro ao criar cliente", detail: e.response?.data || e.message });
   }
 });
 
