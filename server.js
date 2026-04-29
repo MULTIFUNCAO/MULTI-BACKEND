@@ -341,7 +341,7 @@ app.post("/webhook/asaas", async (req, res) => {
   const user = await getUser(phone);
   await upsertUser(phone, { is_pro: true });
   await supabase.from("payments").update({ status: "PAID", paid_at: new Date().toISOString() }).eq("payment_id", payment.id);
-      mobilePhone: phone.replace(/\D/g,""),
+      mobilePhone: (()=>{ const d=phone.replace(/\D/g,""); return "("+d.slice(0,2)+") "+d.slice(2,7)+"-"+d.slice(7); })(),
   log("PRO ATIVADO", { phone, paymentId: payment.id });
 
   // Send confirmation email
