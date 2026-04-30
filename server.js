@@ -562,3 +562,29 @@ app.post("/api/webhook-asaas", async (req, res) => {
   }
   res.sendStatus(200);
 });
+
+// ── COBRAR CARTÃO ──────────────────────────────────────────
+app.post("/api/cobrar-cartao", async (req, res) => {
+  const { email, name, phone, plan, cardNumber, cardHolder, expiryMonth, expiryYear, cvv, installments } = req.body;
+  if (!email || !cardNumber) return res.status(400).json({ error: "Dados incompletos" });
+  const { data: userData } = await supabase.from("users").select("customer_id").eq("email", email).maybeSingle();
+  const customerId = userData?.customer_id;
+  if (!customerId) return res.status(400).json({ error: "Cliente não encontrado" });
+  const planMap = { monthly: 29.90, quarterly: 69.90, annual: 199.90 };
+  const value = planMap[plan] || 29.90;
+  try {
+    const r = await axios.post(`${ASAAS_URL}/payments`, {
+      customer: customerId, billingType: "CREDIT_CARD", value,
+      dueDate: new Date().toISOString().split("T")[0],
+      creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
+      creditCardHolderInfo: { name: cardHolder, email, phone: phone || "11999999999", postalCode: "01310100", addressNumber: "1" },
+      installmentCount: installments || 1, description: `Multi PRO - ${plan}`
+    }, { headers: { access_token: process.env.ASAAS_API_KEY } });
+    if (r.data.status === "CONFIRMED" || r.data.status === "RECEIVED") {
+      await supabase.from("users").update({ is_pro: true, payment_id: r.data.id }).eq("email", email);
+    }
+    res.json({ success: true, status: r.data.status, paymentId: r.data.id });
+  } catch(e) {
+    res.status(500).json({ error: e.response?.data?.errors?.[0]?.description || "Erro no cartão" });
+  }
+});
