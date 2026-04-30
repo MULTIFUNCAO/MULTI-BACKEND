@@ -52,17 +52,17 @@ function log(tag, data) {
 
 // ─── DB Helpers ──────────────────────────────────────────────────────────────
 async function getUser(phone) {
-  const { data } = await supabase.from("users").select("*").eq("phone", phone).single();
+  const { data } = await supabase.from("users").select("*").eq("phone", phone).maybeSingle();
   return data;
 }
 
 async function upsertUser(phone, fields) {
-  const { data } = await supabase.from("users").upsert({ phone, ...fields }, { onConflict: "phone" }).select().single();
+  const { data } = await supabase.from("users").upsert({ phone, ...fields }, { onConflict: "phone" }).select().maybeSingle();
   return data;
 }
 
 async function savePayment(fields) {
-  const { data } = await supabase.from("payments").upsert(fields, { onConflict: "payment_id" }).select().single();
+  const { data } = await supabase.from("payments").upsert(fields, { onConflict: "payment_id" }).select().maybeSingle();
   return data;
 }
 
@@ -267,7 +267,7 @@ app.post("/api/criar-cliente", async (req, res) => {
 app.post("/api/gerar-pix", async (req, res) => {
   const { plan = "monthly", phone, name, email } = req.body;
   if (!email) return res.status(400).json({ error: "email obrigatorio" });
-  const { data: userData } = await supabase.from("users").select("customer_id").eq("email", email).single();
+  const { data: userData } = await supabase.from("users").select("customer_id").eq("email", email).maybeSingle();
   const customerId = userData?.customer_id;
 
   const pd = PLANS[plan] || PLANS.monthly;
@@ -431,7 +431,7 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
-    const { data: profile } = await supabase.from("users").select("*").eq("email", email).single();
+    const { data: profile } = await supabase.from("users").select("*").eq("email", email).maybeSingle();
     log("LOGIN", { email });
     res.json({ ok: true, token: data.session.access_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: profile?.is_pro || false } });
   } catch (e) {
@@ -502,7 +502,7 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
 app.post("/api/enderecos", async (req, res) => {
   const { phone, label, street, city, cep } = req.body; const user_id = phone;
   
-  const { data, error } = await supabase.from("enderecos").insert({ user_id: phone, label, street, city, cep }).select().single();
+  const { data, error } = await supabase.from("enderecos").insert({ user_id: phone, label, street, city, cep }).select().maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -517,7 +517,7 @@ app.get("/api/enderecos/:user_id", async (req, res) => {
 app.post("/api/cartoes", async (req, res) => {
   const { phone, nome, numero, bandeira, tipo } = req.body; const user_id = phone;
   
-  const { data, error } = await supabase.from("cartoes").insert({ user_id, nome, numero, bandeira, tipo }).select().single();
+  const { data, error } = await supabase.from("cartoes").insert({ user_id, nome, numero, bandeira, tipo }).select().maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -532,7 +532,7 @@ app.put("/api/enderecos/:id", async (req, res) => {
   const { id } = req.params;
   const { label, street, city, cep } = req.body;
   try {
-    const { data, error } = await supabase.from("enderecos").update({ label, street, city, cep }).eq("id", id).select().single();
+    const { data, error } = await supabase.from("enderecos").update({ label, street, city, cep }).eq("id", id).select().maybeSingle();
     if (error) throw error;
     res.json({ address: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
