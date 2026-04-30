@@ -57,7 +57,7 @@ async function getUser(phone) {
 }
 
 async function upsertUser(phone, fields) {
-  const { data } = await supabase.from("users").upsert({ phone, ...fields }, { onConflict: "phone" }).select().maybeSingle();
+  const { data } = await supabase.from("users").upsert({ phone, ...fields }, { onConflict: "email" }).select().maybeSingle();
   return data;
 }
 
