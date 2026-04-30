@@ -548,3 +548,17 @@ app.delete("/api/cartoes/:id", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
+
+// ── WEBHOOK ASAAS ──────────────────────────────────────────
+app.post("/api/webhook-asaas", async (req, res) => {
+  const { event, payment } = req.body;
+  console.log("[WEBHOOK]", event, payment?.id);
+  if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
+    const paymentId = payment?.id;
+    if (paymentId) {
+      await supabase.from("users").update({ is_pro: true }).eq("payment_id", paymentId);
+      console.log("[WEBHOOK] PRO ativado para payment_id:", paymentId);
+    }
+  }
+  res.sendStatus(200);
+});
