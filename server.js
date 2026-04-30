@@ -265,8 +265,10 @@ app.post("/api/criar-cliente", async (req, res) => {
 // ASAAS — Gerar PIX
 // ════════════════════════════════════════════════════════════════════════════
 app.post("/api/gerar-pix", async (req, res) => {
-  const { customerId, plan = "monthly", phone, name, email } = req.body;
-  if (!customerId) return res.status(400).json({ error: "customerId obrigatório" });
+  const { plan = "monthly", phone, name, email } = req.body;
+  if (!email) return res.status(400).json({ error: "email obrigatorio" });
+  const { data: userData } = await supabase.from("users").select("customer_id").eq("email", email).single();
+  const customerId = userData?.customer_id;
 
   const pd = PLANS[plan] || PLANS.monthly;
   try {
