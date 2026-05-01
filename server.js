@@ -628,3 +628,18 @@ app.get("/api/admin/assinantes-pro", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+app.get('/api/admin/pedidos-hoje', async (req, res) => {
+  const key = req.headers['x-admin-key'];
+  if (key !== 'multi2026') return res.status(401).json({ error: 'Nao autorizado' });
+  try {
+    const hoje = new Date();
+    hoje.setHours(0,0,0,0);
+    const { data } = await supabase
+      .from('service_requests')
+      .select('*')
+      .gte('created_at', hoje.toISOString())
+      .order('created_at', { ascending: false });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
