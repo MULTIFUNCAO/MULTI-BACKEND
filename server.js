@@ -578,7 +578,7 @@ app.post("/api/cobrar-cartao", async (req, res) => {
       dueDate: new Date().toISOString().split("T")[0],
       creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
       creditCardHolderInfo: { name: cardHolder, email, phone: phone || "11999999999", postalCode: "01310100", addressNumber: "1" },
-      installmentCount: installments || 1, description: `Multi PRO - ${plan}`
+      installmentCount: installments || 1, installmentValue: value, description: `Multi PRO - ${plan}`
     }, { headers: { access_token: process.env.ASAAS_API_KEY } });
     if (r.data.status === "CONFIRMED" || r.data.status === "RECEIVED") {
       await supabase.from("users").update({ is_pro: true, payment_id: r.data.id }).eq("email", email);
