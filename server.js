@@ -622,7 +622,7 @@ app.get("/api/admin/assinantes-pro", async (req, res) => {
   const key = req.headers["x-admin-key"];
   if (key !== "multi2026") return res.status(401).json({ error: "Não autorizado" });
   try {
-    const { data } = await supabase.from("users").select("name,email,whatsapp,created_at,payment_id,is_pro").neq("is_pro", false).neq("is_pro", null);
+    const { data: allUsers } = await supabase.from("users").select("name,email,whatsapp,created_at,payment_id,is_pro"); const data = (allUsers||[]).filter(u => u.is_pro);
     res.json(data || []);
   } catch(e) {
     res.status(500).json({ error: e.message });
