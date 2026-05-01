@@ -573,7 +573,7 @@ app.post("/api/cobrar-cartao", async (req, res) => {
   const planMap = { monthly: 29.90, quarterly: 69.90, annual: 199.90 };
   const value = planMap[plan] || 29.90;
   try {
-    const r = await axios.post(`${ASAAS_URL}/payments`, {
+    const r = await axios.post(`${ASAAS_BASE}/payments`, {
       customer: customerId, billingType: "CREDIT_CARD", value,
       dueDate: new Date().toISOString().split("T")[0],
       creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
