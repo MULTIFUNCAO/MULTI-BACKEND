@@ -246,7 +246,7 @@ app.post("/api/criar-cliente", async (req, res) => {
       const { data } = await asaas.post("/customers", {
         name,
         email: email || undefined,
-      cpfCnpj: "52998224725",
+      cpfCnpj: cpf || "52998224725",
       });
       customerId = data.id;
     }
@@ -565,7 +565,7 @@ app.post("/api/webhook-asaas", async (req, res) => {
 
 // ── COBRAR CARTÃO ──────────────────────────────────────────
 app.post("/api/cobrar-cartao", async (req, res) => {
-  const { email, name, phone, plan, cardNumber, cardHolder, expiryMonth, expiryYear, cvv, installments } = req.body;
+  const { email, name, phone, plan, cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, installments } = req.body;
   if (!email || !cardNumber) return res.status(400).json({ error: "Dados incompletos" });
   const { data: userData } = await supabase.from("users").select("customer_id").eq("email", email).maybeSingle();
   const customerId = userData?.customer_id;
