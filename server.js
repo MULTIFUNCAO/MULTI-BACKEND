@@ -616,3 +616,15 @@ app.get("/api/admin/stats", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── ADMIN - ASSINANTES PRO ─────────────────────────────────
+app.get("/api/admin/assinantes-pro", async (req, res) => {
+  const key = req.headers["x-admin-key"];
+  if (key !== "multi2026") return res.status(401).json({ error: "Não autorizado" });
+  try {
+    const { data } = await supabase.from("users").select("name,email,whatsapp,created_at,payment_id").eq("is_pro", true);
+    res.json(data || []);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
