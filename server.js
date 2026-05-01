@@ -585,6 +585,7 @@ app.post("/api/cobrar-cartao", async (req, res) => {
     }
     res.json({ success: true, status: r.data.status, paymentId: r.data.id });
   } catch(e) {
-    res.status(500).json({ error: e.response?.data?.errors?.[0]?.description || "Erro no cartão" });
+    console.error("[CARTAO ERROR]", JSON.stringify(e.response?.data || e.message));
+    res.status(500).json({ error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || "Erro no cartão", detail: e.response?.data });
   }
 });
