@@ -643,3 +643,16 @@ app.get('/api/admin/pedidos-hoje', async (req, res) => {
     res.json(data || []);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/api/admin/receita', async (req, res) => {
+  const key = req.headers['x-admin-key'];
+  if (key !== 'multi2026') return res.status(401).json({ error: 'Nao autorizado' });
+  try {
+    const { data } = await supabase
+      .from('service_requests')
+      .select('*')
+      .eq('status','completed')
+      .order('created_at', { ascending: false });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
