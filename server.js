@@ -589,3 +589,30 @@ app.post("/api/cobrar-cartao", async (req, res) => {
     res.status(500).json({ error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || "Erro no cartão", detail: e.response?.data });
   }
 });
+
+// ── ADMIN STATS ────────────────────────────────────────────
+app.get("/api/admin/stats", async (req, res) => {
+  const key = req.headers["x-admin-key"];
+  if (key !== "multi2026") return res.status(401).json({ error: "Não autorizado" });
+  try {
+    const { data: users } = await supabase.from("users").select("is_pro,role,created_at,payment_id");
+    const total = users?.length || 0;
+    const pros = users?.filter(u => u.role === "professional") || [];
+    const clients = users?.filter(u => u.role === "client") || [];
+    const proAtivos = users?.filter(u => u.is_pro) || [];
+    const hoje = new Date().toISOString().split("T")[0];
+    const novosHoje = users?.filter(u => u.created_at?.startsWith(hoje)) || [];
+    const mrr = proAtivos.length * 29.90;
+    res.json({
+      totalUsers: total,
+      totalPros: pros.length,
+      totalClients: clients.length,
+      proAtivos: proAtivos.length,
+      mrr: mrr.toFixed(2),
+      novosHoje: novosHoje.length,
+      receitaEstimada: (proAtivos.length * 29.90).toFixed(2)
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
