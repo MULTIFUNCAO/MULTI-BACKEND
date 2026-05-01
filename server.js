@@ -577,7 +577,7 @@ app.post("/api/cobrar-cartao", async (req, res) => {
       customer: customerId, billingType: "CREDIT_CARD", value,
       dueDate: new Date().toISOString().split("T")[0],
       creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
-      creditCardHolderInfo: { name: cardHolder, email, phone: phone || "11999999999", postalCode: "01310100", addressNumber: "1" },
+      creditCardHolderInfo: { name: cardHolder, email, phone: phone || "11999999999", cpfCnpj: "52998224725", postalCode: "01310100", addressNumber: "1" },
       installmentCount: installments || 1, installmentValue: value, description: `Multi PRO - ${plan}`
     }, { headers: { access_token: process.env.ASAAS_API_KEY } });
     if (r.data.status === "CONFIRMED" || r.data.status === "RECEIVED") {
