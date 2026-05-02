@@ -264,6 +264,50 @@ app.post("/api/criar-cliente", async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 // ASAAS — Gerar PIX
 // ════════════════════════════════════════════════════════════════════════════
+
+// ── PIX para pagamento de serviço (valor livre) ──────────────────
+app.post("/api/gerar-pix-servico", async (req, res) => {
+  const { customerId, value, description, phone, name, email } = req.body;
+  try {
+    // Criar cliente se não tiver customerId
+    let custId = customerId;
+    if (!custId) {
+      const custRes = await asaas.post("/customers", {
+        name: name || "Cliente Multi",
+        email: email || "",
+        mobilePhone: phone || "",
+        externalReference: phone || email,
+      });
+      custId = custRes.data.id;
+    }
+
+    // Criar cobrança PIX
+    const pay = await asaas.post("/payments", {
+      customer: custId,
+      billingType: "PIX",
+      value: parseFloat(value),
+      dueDate: new Date().toISOString().split("T")[0],
+      description: description || "Pagamento de servico - Multi",
+      externalReference: phone || email || custId,
+    });
+
+    const qr = await asaas.get(`/payments/${pay.data.id}/pixQrCode`);
+
+    log("PIX SERVICO GERADO", { paymentId: pay.data.id, value });
+
+    res.json({
+      paymentId:    pay.data.id,
+      pixCode:      qr.data.payload,
+      qrCodeBase64: qr.data.encodedImage,
+      expiresAt:    qr.data.expirationDate,
+      value:        pay.data.value,
+    });
+  } catch (e) {
+    log("ERRO gerar-pix-servico", e.response?.data || e.message);
+    res.status(500).json({ error: "Erro ao gerar PIX", detail: e.response?.data || e.message });
+  }
+});
+
 app.post("/api/gerar-pix", async (req, res) => {
   const { plan = "monthly", phone, name, email } = req.body;
   if (!email) return res.status(400).json({ error: "email obrigatorio" });
