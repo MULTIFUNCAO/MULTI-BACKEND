@@ -431,6 +431,20 @@ app.get("/api/admin/pagamentos", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+
+// ─── Webhook Asaas ───────────────────────────────────────────────────────────
+app.post('/api/webhook/asaas', (req, res) => {
+  const { event, payment } = req.body;
+  console.log('[WEBHOOK]', event, payment?.id, payment?.status);
+  
+  if (event === 'PAYMENT_RECEIVED' || event === 'PAYMENT_CONFIRMED') {
+    // Pagamento confirmado - frontend faz polling e detecta automaticamente
+    console.log('[WEBHOOK] Pagamento confirmado:', payment?.id, 'valor:', payment?.value);
+  }
+  
+  res.status(200).json({ received: true });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`
