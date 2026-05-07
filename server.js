@@ -328,8 +328,8 @@ app.post("/api/gerar-pix-servico", async (req, res) => {
       expiresAt:    qr.data.expirationDate,
       value:        pay.data.value,
     });
-  } catch (e) {
     notifyProfessionals(description||"Serviço", name||"Cliente", value);
+  } catch (e) {
     log("ERRO gerar-pix-servico", e.response?.data || e.message);
     res.status(500).json({ error: "Erro ao gerar PIX", detail: e.response?.data || e.message });
   }
