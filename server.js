@@ -279,8 +279,8 @@ async function notifyProfessionals(category, clientName, value) {
       body: JSON.stringify({
         app_id: process.env.ONESIGNAL_APP_ID,
         included_segments: ['Total Subscriptions'],
-        headings: { pt: '🔨 NOVO PEDIDO — Multi!' },
-        contents: { pt: category + ' • ' + clientName + ' • R$ ' + value },
+        headings: { en: '🔨 NEW ORDER — Multi!', pt: '🔨 NOVO PEDIDO — Multi!' },
+        contents: { en: category + ' • ' + clientName + ' • R$ ' + value, pt: category + ' • ' + clientName + ' • R$ ' + value },
         url: 'https://multifuncao.com.br'
       })
     });
