@@ -275,7 +275,7 @@ app.post("/api/gerar-pix-servico", async (req, res) => {
       const custRes = await asaas.post("/customers", {
         name: name || "Cliente Multi",
         email: email || "",
-        mobilePhone: phone ? phone.replace(/D/g,"") : undefined,
+        
         externalReference: phone || email,
         cpfCnpj: cpf || "00000000191",
       });
