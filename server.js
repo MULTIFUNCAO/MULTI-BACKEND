@@ -267,7 +267,7 @@ app.post("/api/criar-cliente", async (req, res) => {
 
 // ── PIX para pagamento de serviço (valor livre) ──────────────────
 app.post("/api/gerar-pix-servico", async (req, res) => {
-  const { customerId, value, description, phone, name, email } = req.body;
+  const { customerId, value, description, phone, name, email, cpf } = req.body;
   try {
     // Criar cliente se não tiver customerId
     let custId = customerId;
@@ -277,6 +277,7 @@ app.post("/api/gerar-pix-servico", async (req, res) => {
         email: email || "",
         mobilePhone: phone || "",
         externalReference: phone || email,
+        cpfCnpj: cpf || "00000000191",
       });
       custId = custRes.data.id;
     }
