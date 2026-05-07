@@ -266,6 +266,31 @@ app.post("/api/criar-cliente", async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── PIX para pagamento de serviço (valor livre) ──────────────────
+
+// ─── Notificar profissionais via OneSignal ───────────────────────────────────
+async function notifyProfessionals(category, clientName, value) {
+  try {
+    const res = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + process.env.ONESIGNAL_API_KEY
+      },
+      body: JSON.stringify({
+        app_id: process.env.ONESIGNAL_APP_ID,
+        included_segments: ['Total Subscriptions'],
+        headings: { pt: '🔨 NOVO PEDIDO — Multi!' },
+        contents: { pt: category + ' • ' + clientName + ' • R$ ' + value },
+        url: 'https://multifuncao.com.br'
+      })
+    });
+    const data = await res.json();
+    console.log('[ONESIGNAL]', data.id || data.errors);
+  } catch(e) {
+    console.log('[ONESIGNAL ERROR]', e.message);
+  }
+}
+
 app.post("/api/gerar-pix-servico", async (req, res) => {
   const { customerId, value, description, phone, name, email, cpf } = req.body;
   try {
@@ -304,6 +329,7 @@ app.post("/api/gerar-pix-servico", async (req, res) => {
       value:        pay.data.value,
     });
   } catch (e) {
+    notifyProfessionals(description||"Serviço", name||"Cliente", value);
     log("ERRO gerar-pix-servico", e.response?.data || e.message);
     res.status(500).json({ error: "Erro ao gerar PIX", detail: e.response?.data || e.message });
   }
