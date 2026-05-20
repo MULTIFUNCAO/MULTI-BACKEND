@@ -635,14 +635,18 @@ app.delete("/api/cartoes/:id", async (req, res) => {
 });
 
 // ── WEBHOOK ASAAS ──────────────────────────────────────────
-app.post("/api/webhook-asaas", async (req, res) => {
+app.post("/ost("/api/webhook-asaas", async (req, res) => {
   const { event, payment } = req.body;
   console.log("[WEBHOOK]", event, payment?.id);
   if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
     const paymentId = payment?.id;
     if (paymentId) {
       await supabase.from("users").update({ is_pro: true }).eq("payment_id", paymentId);
-      console.log("[WEBHOOK] PRO ativado para payment_id:", paymentId);
+      const { data: pedidos } = await supabase.from("pedidos").select("id").eq("payment_id", paymentId);
+      if (pedidos && pedidos.length > 0) {
+        await supabase.from("pedidos").update({ status: "pago", phase: 2 }).eq("payment_id", paymentId);
+        console.log("[WEBHOOK] Pedido pago:", paymentId);
+      }
     }
   }
   res.sendStatus(200);
