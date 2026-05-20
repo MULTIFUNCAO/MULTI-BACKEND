@@ -292,7 +292,7 @@ async function notifyProfessionals(category, clientName, value) {
 }
 
 app.post("/api/gerar-pix-servico", async (req, res) => {
-  const { customerId, value, description, phone, name, email, cpf } = req.body;
+  const { customerId, value, description, phone, name, email, cpf } = req.body; console.log("[GERAR-PIX] body:", JSON.stringify(req.body));
   try {
     // Criar cliente se não tiver customerId
     let custId = customerId;
