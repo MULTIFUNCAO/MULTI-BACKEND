@@ -640,7 +640,7 @@ app.delete("/api/cartoes/:id", async (req, res) => {
 });
 
 // ── WEBHOOK ASAAS ──────────────────────────────────────────
-app.post("/ost("/api/webhook-asaas", async (req, res) => {
+app.post("/api/webhook-asaas", async (req, res) => {
   const { event, payment } = req.body;
   console.log("[WEBHOOK]", event, payment?.id);
   if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
