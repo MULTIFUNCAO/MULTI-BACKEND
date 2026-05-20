@@ -321,6 +321,11 @@ app.post("/api/gerar-pix-servico", async (req, res) => {
 
     log("PIX SERVICO GERADO", { paymentId: pay.data.id, value });
 
+    // Salva payment_id no pedido
+    if (req.body.pedidoId) {
+      await supabase.from("pedidos").update({ payment_id: pay.data.id }).eq("id", req.body.pedidoId);
+    }
+
     res.json({
       paymentId:    pay.data.id,
       pixCode:      qr.data.payload,
