@@ -463,6 +463,37 @@ app.get("/api/admin/pagamentos", async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════════════════
 
+// ─── Sugestão de Meta por IA (Aflor Studio) ──────────────────────────────────
+app.post('/api/sugestao-meta', async (req, res) => {
+  const { servicos, meta } = req.body || {};
+  if (!Array.isArray(servicos) || servicos.length === 0 || !(meta > 0)) {
+    return res.status(400).json({ erro: 'Parâmetros inválidos' });
+  }
+  const key = process.env.ANTHROPIC_KEY;
+  if (!key) return res.status(500).json({ erro: 'ANTHROPIC_KEY não configurada no servidor' });
+
+  const lista = servicos.map(s =>
+    `- ${s.nome}${s.categoria ? ' (' + s.categoria + ')' : ''} — R$ ${Number(s.preco).toFixed(2).replace('.', ',')}`
+  ).join('\n');
+
+  const prompt = `Você é um assistente de gestão para salões de beleza brasileiros.\nA empresária quer atingir uma meta financeira e selecionou os seguintes serviços:\n${lista}\nDistribua percentuais de demanda realistas entre esses serviços.\nConsidere que serviços mais frequentes (design de sobrancelha, escova, manicure) têm naturalmente maior volume que serviços esporádicos (alongamento, remoção, tratamentos especiais).\nA soma de todos os percentuais deve ser exatamente 1.0.\nResponda SOMENTE em JSON válido, sem texto adicional, sem markdown, sem explicação:\n{"Nome do Serviço": percentual_decimal}`;
+
+  try {
+    const r = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      { model: 'claude-sonnet-4-6', max_tokens: 512, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 20000 }
+    );
+    const txt = r.data?.content?.[0]?.text || '{}';
+    const match = txt.match(/\{[\s\S]*\}/);
+    const parsed = match ? JSON.parse(match[0]) : {};
+    res.json(parsed);
+  } catch (e) {
+    console.error('[sugestao-meta] Erro Claude API:', e.message);
+    res.status(500).json({ erro: 'IA indisponível' });
+  }
+});
+
 // ─── Webhook Asaas ───────────────────────────────────────────────────────────
 app.post('/api/webhook/asaas', (req, res) => {
   const { event, payment } = req.body;
