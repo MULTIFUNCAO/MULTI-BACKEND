@@ -11,7 +11,8 @@ const sgMail   = require("@sendgrid/mail");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+const allowedOrigins = [process.env.FRONTEND_URL, "https://floragestao.com.br"].filter(Boolean);
+app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : "*" }));
 app.use(express.json());
 
 // ─── Supabase ────────────────────────────────────────────────────────────────
