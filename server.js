@@ -495,6 +495,26 @@ app.post('/api/sugestao-meta', async (req, res) => {
   }
 });
 
+// ─── Chat IA Estratégica (Aflor Studio) ──────────────────────────────────────
+app.post('/api/ia-chat', async (req, res) => {
+  const { system, message } = req.body || {};
+  if (!message) return res.status(400).json({ erro: 'message obrigatório' });
+  const key = process.env.ANTHROPIC_KEY;
+  if (!key) return res.status(500).json({ erro: 'ANTHROPIC_KEY não configurada' });
+  try {
+    const r = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      { model: 'claude-haiku-4-5-20251001', max_tokens: 600, system: system || '', messages: [{ role: 'user', content: message }] },
+      { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 20000 }
+    );
+    const resposta = r.data?.content?.[0]?.text || '';
+    res.json({ resposta });
+  } catch (e) {
+    console.error('[ia-chat] Erro Claude API:', e.message);
+    res.status(500).json({ erro: 'IA indisponível' });
+  }
+});
+
 // ─── Webhook Asaas ───────────────────────────────────────────────────────────
 app.post('/api/webhook/asaas', (req, res) => {
   const { event, payment } = req.body;
