@@ -551,7 +551,7 @@ app.post("/api/auth/cadastro", async (req, res) => {
       user_metadata: { name, role },
     });
     if (authError) {
-      if (authError.message.includes("already registered"))
+      if (/already.*registered/i.test(authError.message))
         return res.status(409).json({ error: "E-mail já cadastrado. Faça login." });
       throw authError;
     }
