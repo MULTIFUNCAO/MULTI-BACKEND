@@ -880,6 +880,10 @@ app.post("/api/cron/lembretes", async (req, res) => {
               include_player_ids: playerIds,
               headings: { pt: "Multi" },
               contents: { pt: textos[tipo] },
+              // Só o lembrete pós-horário leva direto pra tela de confirmar
+              // conclusão (Fase 4) — cada dispositivo abre a tela certa
+              // (cliente/profissional) sozinho, pelo próprio papel logado.
+              ...(tipo === "pos" ? { url: "https://multifuncao.com.br/?tela=concluir&pedido=" + p.id } : {}),
             }),
           });
           oneSignalResp = await r.json();
