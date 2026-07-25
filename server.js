@@ -815,3 +815,88 @@ app.get('/api/admin/clientes', async (req, res) => {
     res.json(data || []);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// FASE 3 — Lembretes automáticos de agendamento (chamado por cron externo,
+// ver .github/workflows/lembretes-cron.yml no repo MULTI). Idempotente via as
+// colunas lembrete_*_enviado_em em "pedidos" — pode rodar quantas vezes quiser
+// por hora que não manda o mesmo lembrete duas vezes.
+// ════════════════════════════════════════════════════════════════════════════
+app.post("/api/cron/lembretes", async (req, res) => {
+  if (req.headers["x-cron-key"] !== process.env.CRON_KEY) {
+    return res.status(401).json({ error: "Não autorizado" });
+  }
+
+  const resumo = { processados: 0, notificados: 0, erros: [] };
+
+  try {
+    const { data: pedidos, error } = await supabase
+      .from("pedidos")
+      .select("id,categoria,cliente_id,profissional_aceito,data_agendada,lembrete_vespera_enviado_em,lembrete_dia_enviado_em,lembrete_pos_enviado_em")
+      .in("status", ["em_andamento", "executando"])
+      .not("data_agendada", "is", null)
+      .not("aceite_formal_cliente_em", "is", null)
+      .not("aceite_formal_profissional_em", "is", null);
+    if (error) throw error;
+
+    const agora = new Date();
+    const hojeStr = agora.toISOString().slice(0, 10);
+    const amanha = new Date(agora);
+    amanha.setDate(amanha.getDate() + 1);
+    const amanhaStr = amanha.toISOString().slice(0, 10);
+
+    for (const p of (pedidos || [])) {
+      resumo.processados++;
+      const dataAgendada = new Date(p.data_agendada);
+      const dataStr = dataAgendada.toISOString().slice(0, 10);
+
+      let tipo = null;
+      if (dataStr === amanhaStr && !p.lembrete_vespera_enviado_em) tipo = "vespera";
+      else if (dataStr === hojeStr && !p.lembrete_dia_enviado_em) tipo = "dia";
+      else if (agora.getTime() > dataAgendada.getTime() + 2 * 60 * 60 * 1000 && !p.lembrete_pos_enviado_em) tipo = "pos";
+      if (!tipo) continue;
+
+      try {
+        const emails = [p.cliente_id, p.profissional_aceito].filter(Boolean);
+        const [{ data: usuarios }, { data: empresas }] = await Promise.all([
+          supabase.from("usuarios").select("onesignal_player_id").in("email", emails).not("onesignal_player_id", "is", null),
+          supabase.from("empresas").select("onesignal_player_id").in("email", emails).not("onesignal_player_id", "is", null),
+        ]);
+        const playerIds = [...new Set([...(usuarios || []), ...(empresas || [])].map(u => u.onesignal_player_id).filter(Boolean))];
+
+        const textos = {
+          vespera: `🔔 Lembrete: seu serviço de ${p.categoria} está agendado pra amanhã.`,
+          dia:     `📅 Hoje é o dia do seu serviço de ${p.categoria}.`,
+          pos:     `✅ O serviço de ${p.categoria} foi realizado? Confirma no app.`,
+        };
+
+        let oneSignalResp = null;
+        if (playerIds.length) {
+          const r = await fetch("https://onesignal.com/api/v1/notifications", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.ONESIGNAL_API_KEY },
+            body: JSON.stringify({
+              app_id: process.env.ONESIGNAL_APP_ID,
+              include_player_ids: playerIds,
+              headings: { pt: "Multi" },
+              contents: { pt: textos[tipo] },
+            }),
+          });
+          oneSignalResp = await r.json();
+          resumo.notificados += playerIds.length;
+        }
+
+        const campo = tipo === "vespera" ? "lembrete_vespera_enviado_em" : tipo === "dia" ? "lembrete_dia_enviado_em" : "lembrete_pos_enviado_em";
+        await supabase.from("pedidos").update({ [campo]: new Date().toISOString() }).eq("id", p.id);
+
+        console.log(`[LEMBRETES] pedido ${p.id} — ${tipo} — players: ${playerIds.length}`, oneSignalResp?.id || oneSignalResp?.errors || "");
+      } catch (e) {
+        resumo.erros.push({ pedido: p.id, erro: e.message });
+      }
+    }
+
+    res.json(resumo);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
