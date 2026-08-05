@@ -31,9 +31,15 @@ const keyPreview = process.env.SENDGRID_API_KEY
 console.log("[SENDGRID] Chave carregada:", keyPreview);
 
 // ─── Asaas ───────────────────────────────────────────────────────────────────
+// A Asaas migrou o domínio da API — www.asaas.com/sandbox.asaas.com eram os
+// hosts antigos. O alias antigo de produção (www.asaas.com) ainda responde,
+// mas o de sandbox (sandbox.asaas.com) não valida mais chave de sandbox
+// (retorna "chave não pertence a este ambiente" mesmo com chave certa —
+// achado testando a cobrança de assinatura ao vivo). Hosts atuais conforme
+// docs.asaas.com/docs/sandbox.
 const ASAAS_BASE = process.env.ASAAS_ENV === "production"
-  ? "https://www.asaas.com/api/v3"
-  : "https://sandbox.asaas.com/api/v3";
+  ? "https://api.asaas.com/v3"
+  : "https://api-sandbox.asaas.com/v3";
 
 const asaas = axios.create({
   baseURL: ASAAS_BASE,
