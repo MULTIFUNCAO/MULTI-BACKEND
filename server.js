@@ -41,19 +41,6 @@ const ASAAS_BASE = process.env.ASAAS_ENV === "production"
   ? "https://api.asaas.com/v3"
   : "https://api-sandbox.asaas.com/v3";
 
-// DEBUG TEMPORÁRIO — diagnosticar "chave não pertence a este ambiente" que
-// persiste mesmo com ASAAS_ENV=sandbox + chave de sandbox confirmada e host
-// correto (api-sandbox.asaas.com). Remover depois de resolver.
-const BOOT_TIME = new Date().toISOString();
-app.get("/api/debug/asaas-ping", async (req, res) => {
-  try {
-    const r = await axios.get(`${ASAAS_BASE}/finance/balance`, { headers: { access_token: process.env.ASAAS_API_KEY } });
-    res.json({ ok: true, bootTime: BOOT_TIME, base: ASAAS_BASE, keyPreview: (process.env.ASAAS_API_KEY||"").slice(0,12)+"...", data: r.data });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({ ok: false, bootTime: BOOT_TIME, base: ASAAS_BASE, keyPreview: (process.env.ASAAS_API_KEY||"").slice(0,12)+"...", error: e.response?.data || e.message });
-  }
-});
-
 const asaas = axios.create({
   baseURL: ASAAS_BASE,
   headers: { "access_token": process.env.ASAAS_API_KEY, "Content-Type": "application/json" },
