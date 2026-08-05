@@ -709,6 +709,134 @@ app.post("/api/webhook-asaas", async (req, res) => {
   res.sendStatus(200);
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ASSINATURA (usuarios/empresas + tabela "assinaturas") — cobrança real via
+// Asaas, substitui o antigo trial de 7 dias criado direto pelo frontend.
+// A tabela "assinaturas" agora só aceita insert/update via service_role (RLS
+// travada na migration supabase_pendencias_doc_pagamento_migration.sql) —
+// esse endpoint é o ÚNICO jeito de um plano virar "ativa".
+// ════════════════════════════════════════════════════════════════════════════
+const PLANOS_ASSINATURA = {
+  autonomo:     { valor: 29.90,  label: "Multi Autônomo" },
+  pro:          { valor: 59.90,  label: "Multi Pro" },
+  empresa:      { valor: 149.90, label: "Multi Empresa" },
+  empresa_plus: { valor: 299.90, label: "Multi Empresa Pro" },
+};
+
+app.post("/api/assinatura/cobrar", async (req, res) => {
+  const {
+    titularTipo, titularEmail, titularNome, plano,
+    cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, phone,
+  } = req.body || {};
+
+  if (!["usuario", "empresa"].includes(titularTipo))
+    return res.status(400).json({ error: "titularTipo inválido" });
+  const planoInfo = PLANOS_ASSINATURA[plano];
+  if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+  if (!titularEmail || !cardNumber || !cardHolder || !expiryMonth || !expiryYear || !cvv || !cpf)
+    return res.status(400).json({ error: "Dados de pagamento incompletos" });
+
+  try {
+    // 1) Cliente Asaas (busca por e-mail, cria se não existir — mesmo padrão
+    //    de /api/criar-cliente, mas sem depender de "phone" nem da tabela
+    //    legada "users").
+    let customerId;
+    const search = await asaas.get(`/customers?email=${encodeURIComponent(titularEmail)}`);
+    if (search.data?.data?.length > 0) {
+      customerId = search.data.data[0].id;
+    } else {
+      const { data } = await asaas.post("/customers", {
+        name: titularNome || titularEmail, email: titularEmail, cpfCnpj: cpf,
+        mobilePhone: (phone || "").replace(/\D/g, "") || undefined,
+      });
+      customerId = data.id;
+    }
+
+    // 2) Cobrança do primeiro mês — cartão de crédito, síncrono (mesmo padrão
+    //    testado em /api/cobrar-cartao). Renovação automática do mês seguinte
+    //    ainda NÃO está automatizada aqui (precisaria da Asaas Subscriptions
+    //    API ou de um job agendado) — ver aviso no retorno.
+    const pay = await asaas.post("/payments", {
+      customer: customerId, billingType: "CREDIT_CARD", value: planoInfo.valor,
+      dueDate: new Date().toISOString().split("T")[0],
+      creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
+      creditCardHolderInfo: {
+        name: cardHolder, email: titularEmail, cpfCnpj: cpf,
+        phone: (phone || "").replace(/\D/g, "") || undefined,
+        postalCode: "01310100", addressNumber: "1",
+      },
+      description: `${planoInfo.label} — assinatura mensal`,
+    });
+
+    if (!["CONFIRMED", "RECEIVED"].includes(pay.data.status)) {
+      log("ASSINATURA COBRANCA PENDENTE", { titularEmail, plano, status: pay.data.status, paymentId: pay.data.id });
+      return res.status(402).json({ error: "Pagamento não confirmado", status: pay.data.status });
+    }
+
+    const inicio = new Date();
+    const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    const { error: upsertErr } = await supabase.from("assinaturas").upsert({
+      titular_tipo: titularTipo,
+      titular_email: titularEmail,
+      plano,
+      status: "ativa",
+      inicio: inicio.toISOString(),
+      expira_em: proximaCobranca.toISOString(),
+      proxima_cobranca: proximaCobranca.toISOString(),
+      asaas_customer_id: customerId,
+      asaas_payment_id: pay.data.id,
+    }, { onConflict: "titular_tipo,titular_email" });
+    if (upsertErr) throw upsertErr;
+
+    log("ASSINATURA ATIVADA", { titularEmail, plano, paymentId: pay.data.id });
+    res.json({
+      success: true,
+      status: "ativa",
+      valor: planoInfo.valor,
+      proximaCobranca: proximaCobranca.toISOString(),
+      paymentId: pay.data.id,
+    });
+  } catch (e) {
+    log("ERRO assinatura/cobrar", e.response?.data || e.message);
+    res.status(500).json({
+      error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || "Erro ao processar pagamento",
+      detail: e.response?.data,
+    });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADMIN — Documentação do profissional (protegido por x-admin-key, mesmo
+// padrão de /api/admin/usuarios). Único jeito de um documento virar
+// "verified"/"rejected" — o trigger trg_lock_doc_status no Postgres também
+// bloqueia isso vindo de qualquer sessão que não seja service_role, então
+// mesmo sem esse endpoint um usuário não consegue se auto-aprovar.
+// ════════════════════════════════════════════════════════════════════════════
+app.get("/api/admin/documentos", async (req, res) => {
+  if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
+    return res.status(401).json({ error: "Não autorizado" });
+  const { data, error } = await supabase.from("usuarios")
+    .select("email,name,doc_rg_status,doc_rg_url,doc_crim_status,doc_crim_url,doc_address_status,doc_address_url,autonomia_aceita_em")
+    .eq("role", "professional")
+    .or("doc_rg_status.eq.analysis,doc_crim_status.eq.analysis,doc_address_status.eq.analysis");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ total: data?.length || 0, documentos: data });
+});
+
+app.post("/api/admin/documentos/verificar", async (req, res) => {
+  if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
+    return res.status(401).json({ error: "Não autorizado" });
+  const { email, docId, aprovado } = req.body || {};
+  if (!email || !["rg", "crim", "address"].includes(docId) || typeof aprovado !== "boolean")
+    return res.status(400).json({ error: "Dados inválidos" });
+  const col = `doc_${docId}_status`;
+  const { error } = await supabase.from("usuarios").update({ [col]: aprovado ? "verified" : "rejected" }).eq("email", email);
+  if (error) return res.status(500).json({ error: error.message });
+  log("DOC VERIFICADO", { email, docId, aprovado });
+  res.json({ success: true });
+});
+
 // ── COBRAR CARTÃO ──────────────────────────────────────────
 app.post("/api/cobrar-cartao", async (req, res) => {
   const { email, name, phone, plan, cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, installments } = req.body;
