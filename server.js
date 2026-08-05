@@ -817,10 +817,10 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
       paymentId: pay.data.id,
     });
   } catch (e) {
-    log("ERRO assinatura/cobrar", e.response?.data || e.message);
+    log("ERRO assinatura/cobrar", e.response?.data || e.message || e);
     res.status(500).json({
-      error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || "Erro ao processar pagamento",
-      detail: e.response?.data,
+      error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || e.message || "Erro ao processar pagamento",
+      detail: e.response?.data || { message: e.message, code: e.code, hint: e.hint, details: e.details },
     });
   }
 });
