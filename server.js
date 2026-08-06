@@ -723,11 +723,33 @@ app.post("/api/webhook-asaas", async (req, res) => {
 // esse endpoint é o ÚNICO jeito de um plano virar "ativa".
 // ════════════════════════════════════════════════════════════════════════════
 const PLANOS_ASSINATURA = {
-  autonomo:     { valor: 29.90,  label: "Multi Autônomo" },
-  pro:          { valor: 59.90,  label: "Multi Pro" },
-  empresa:      { valor: 149.90, label: "Multi Empresa" },
-  empresa_plus: { valor: 299.90, label: "Multi Empresa Pro" },
+  autonomo: { valor: 29.90,  label: "Multi Autônomo" },
+  pro:      { valor: 59.90,  label: "Multi Pro" },
+  premium:  { valor: 129.90, label: "Multi Premium" },
 };
+
+// Limites de negócio (categoria/valor/quantidade) por plano do profissional.
+// Espelha PLANO_LIMITES_USUARIO em MULTI/src/App.jsx — repos separados, sem
+// pacote compartilhado, então qualquer mudança aqui precisa ser replicada
+// manualmente lá (e vice-versa). null = sem limite (Premium).
+const PLANO_LIMITES_USUARIO = {
+  autonomo: { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 600  },
+  pro:      { maxCategorias: 3, maxServicosMes: 10, valorMaxServico: 3000 },
+  premium:  { maxCategorias: null, maxServicosMes: null, valorMaxServico: null },
+};
+
+// Ciclo de cobrança rolante de 30 dias a partir de assinaturas.inicio — não
+// existe renovação automática/coluna de "última cobrança" ainda (ver aviso
+// logo acima, em /api/assinatura/cobrar), então o ciclo é sempre calculado
+// on-the-fly a partir da data de início da assinatura.
+function cicloAtualInicio(inicioISO) {
+  const inicio = new Date(inicioISO).getTime();
+  const now = Date.now();
+  const CICLO_MS = 30 * 24 * 60 * 60 * 1000;
+  if (now <= inicio) return new Date(inicio);
+  const ciclosPassados = Math.floor((now - inicio) / CICLO_MS);
+  return new Date(inicio + ciclosPassados * CICLO_MS);
+}
 
 app.post("/api/assinatura/cobrar", async (req, res) => {
   const {
@@ -735,7 +757,11 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
     cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, phone,
   } = req.body || {};
 
-  if (!["usuario", "empresa"].includes(titularTipo))
+  // Planos pagos de empresa deixaram de existir — só profissional (titular_tipo
+  // "usuario") pode assinar a partir daqui. Assinaturas "empresa"/"empresa_plus"
+  // já existentes continuam válidas no banco (ver supabase_planos_premium_migration.sql),
+  // só não é mais possível criar novas por aqui.
+  if (titularTipo !== "usuario")
     return res.status(400).json({ error: "titularTipo inválido" });
   const planoInfo = PLANOS_ASSINATURA[plano];
   if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
