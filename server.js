@@ -751,6 +751,43 @@ function cicloAtualInicio(inicioISO) {
   return new Date(inicio + ciclosPassados * CICLO_MS);
 }
 
+// Busca cliente Asaas por e-mail, cria se não existir — extraído de dentro de
+// /api/assinatura/cobrar pra ser reaproveitado também por /api/assinatura/gerar-pix
+// (mesmo titular não deve virar 2 clientes Asaas diferentes por ter tentado
+// cartão e PIX).
+async function buscarOuCriarClienteAsaas({ email, nome, cpf, phone }) {
+  const search = await asaas.get(`/customers?email=${encodeURIComponent(email)}`);
+  if (search.data?.data?.length > 0) return search.data.data[0].id;
+  const { data } = await asaas.post("/customers", {
+    name: nome || email, email, cpfCnpj: cpf,
+    mobilePhone: (phone || "").replace(/\D/g, "") || undefined,
+  });
+  return data.id;
+}
+
+// Grava/atualiza a linha de "assinaturas" — único ponto que faz isso, chamado
+// só depois que o pagamento já está confirmado de verdade na Asaas (cartão:
+// síncrono, dentro do próprio /api/assinatura/cobrar; PIX: assíncrono, só
+// depois que /api/assinatura/confirmar-pix reconfere o status). RLS trava
+// insert/update de "assinaturas" pra service_role (ver comentário acima).
+async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, customerId }) {
+  const inicio = new Date();
+  const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const { error } = await supabase.from("assinaturas").upsert({
+    titular_tipo: titularTipo,
+    titular_email: titularEmail,
+    plano,
+    status: "ativa",
+    inicio: inicio.toISOString(),
+    expira_em: proximaCobranca.toISOString(),
+    proxima_cobranca: proximaCobranca.toISOString(),
+    asaas_customer_id: customerId,
+    asaas_payment_id: paymentId,
+  }, { onConflict: "titular_tipo,titular_email" });
+  if (error) throw error;
+  return { proximaCobranca };
+}
+
 app.post("/api/assinatura/cobrar", async (req, res) => {
   const {
     titularTipo, titularEmail, titularNome, plano,
@@ -769,25 +806,12 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
     return res.status(400).json({ error: "Dados de pagamento incompletos" });
 
   try {
-    // 1) Cliente Asaas (busca por e-mail, cria se não existir — mesmo padrão
-    //    de /api/criar-cliente, mas sem depender de "phone" nem da tabela
-    //    legada "users").
-    let customerId;
-    const search = await asaas.get(`/customers?email=${encodeURIComponent(titularEmail)}`);
-    if (search.data?.data?.length > 0) {
-      customerId = search.data.data[0].id;
-    } else {
-      const { data } = await asaas.post("/customers", {
-        name: titularNome || titularEmail, email: titularEmail, cpfCnpj: cpf,
-        mobilePhone: (phone || "").replace(/\D/g, "") || undefined,
-      });
-      customerId = data.id;
-    }
+    const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
 
-    // 2) Cobrança do primeiro mês — cartão de crédito, síncrono (mesmo padrão
-    //    testado em /api/cobrar-cartao). Renovação automática do mês seguinte
-    //    ainda NÃO está automatizada aqui (precisaria da Asaas Subscriptions
-    //    API ou de um job agendado) — ver aviso no retorno.
+    // Cobrança do primeiro mês — cartão de crédito, síncrono (mesmo padrão
+    // testado em /api/cobrar-cartao). Renovação automática do mês seguinte
+    // ainda NÃO está automatizada aqui (precisaria da Asaas Subscriptions
+    // API ou de um job agendado) — ver aviso no retorno.
     const pay = await asaas.post("/payments", {
       customer: customerId, billingType: "CREDIT_CARD", value: planoInfo.valor,
       dueDate: new Date().toISOString().split("T")[0],
@@ -805,21 +829,7 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
       return res.status(402).json({ error: "Pagamento não confirmado", status: pay.data.status });
     }
 
-    const inicio = new Date();
-    const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-    const { error: upsertErr } = await supabase.from("assinaturas").upsert({
-      titular_tipo: titularTipo,
-      titular_email: titularEmail,
-      plano,
-      status: "ativa",
-      inicio: inicio.toISOString(),
-      expira_em: proximaCobranca.toISOString(),
-      proxima_cobranca: proximaCobranca.toISOString(),
-      asaas_customer_id: customerId,
-      asaas_payment_id: pay.data.id,
-    }, { onConflict: "titular_tipo,titular_email" });
-    if (upsertErr) throw upsertErr;
+    const { proximaCobranca } = await ativarAssinatura({ titularTipo, titularEmail, plano, paymentId: pay.data.id, customerId });
 
     log("ASSINATURA ATIVADA", { titularEmail, plano, paymentId: pay.data.id });
     res.json({
@@ -835,6 +845,87 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
       error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || e.message || "Erro ao processar pagamento",
       detail: e.response?.data || { message: e.message, code: e.code, hint: e.hint, details: e.details },
     });
+  }
+});
+
+// ── ASSINATURA VIA PIX ────────────────────────────────────────────────────
+// PIX não confirma na hora como cartão — aqui só gera a cobrança (QR code +
+// copia-e-cola). A ativação de verdade em "assinaturas" só acontece em
+// /api/assinatura/confirmar-pix, chamado pelo front depois que o polling em
+// /api/status-pagamento/:id indicar que o pagamento foi recebido.
+app.post("/api/assinatura/gerar-pix", async (req, res) => {
+  const { titularTipo, titularEmail, titularNome, plano, cpf, phone } = req.body || {};
+
+  if (titularTipo !== "usuario")
+    return res.status(400).json({ error: "titularTipo inválido" });
+  const planoInfo = PLANOS_ASSINATURA[plano];
+  if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+  if (!titularEmail || !cpf)
+    return res.status(400).json({ error: "Dados incompletos" });
+
+  try {
+    const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
+
+    const pay = await asaas.post("/payments", {
+      customer: customerId, billingType: "PIX", value: planoInfo.valor,
+      dueDate: new Date().toISOString().split("T")[0],
+      description: `${planoInfo.label} — assinatura mensal (PIX)`,
+      externalReference: `plano:${titularTipo}:${titularEmail}:${plano}`,
+    });
+
+    const qr = await asaas.get(`/payments/${pay.data.id}/pixQrCode`);
+
+    log("ASSINATURA PIX GERADO", { titularEmail, plano, paymentId: pay.data.id });
+    res.json({
+      paymentId: pay.data.id,
+      customerId,
+      pixCode: qr.data.payload,
+      qrCodeBase64: qr.data.encodedImage,
+      expiresAt: qr.data.expirationDate,
+      value: planoInfo.valor,
+    });
+  } catch (e) {
+    log("ERRO assinatura/gerar-pix", e.response?.data || e.message || e);
+    res.status(500).json({
+      error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || e.message || "Erro ao gerar PIX",
+      detail: e.response?.data || { message: e.message },
+    });
+  }
+});
+
+// Confirma e ativa a assinatura depois que o PIX foi pago — reconfere o
+// status direto na Asaas (nunca confia só no que o front informou de volta)
+// antes de gravar em "assinaturas". Idempotente: se chamado de novo pra um
+// pagamento já ativado, só regrava os mesmos dados (upsert).
+app.post("/api/assinatura/confirmar-pix", async (req, res) => {
+  const { paymentId, titularTipo, titularEmail, plano, customerId } = req.body || {};
+  if (!paymentId || !titularTipo || !titularEmail || !plano)
+    return res.status(400).json({ error: "dados_incompletos" });
+  const planoInfo = PLANOS_ASSINATURA[plano];
+  if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+
+  try {
+    const { data: pay } = await asaas.get(`/payments/${paymentId}`);
+    if (!["CONFIRMED", "RECEIVED"].includes(pay.status)) {
+      return res.status(402).json({ error: "pagamento_nao_confirmado", status: pay.status });
+    }
+
+    const { proximaCobranca } = await ativarAssinatura({
+      titularTipo, titularEmail, plano, paymentId,
+      customerId: customerId || pay.customer,
+    });
+
+    log("ASSINATURA PIX ATIVADA", { titularEmail, plano, paymentId });
+    res.json({
+      success: true,
+      status: "ativa",
+      valor: planoInfo.valor,
+      proximaCobranca: proximaCobranca.toISOString(),
+      paymentId,
+    });
+  } catch (e) {
+    log("ERRO assinatura/confirmar-pix", e.response?.data || e.message || e);
+    res.status(500).json({ error: e.response?.data?.message || e.message || "Erro ao confirmar pagamento" });
   }
 });
 
