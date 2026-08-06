@@ -403,6 +403,29 @@ app.get("/api/status-pagamento/:id", async (req, res) => {
   }
 });
 
+// Debug temporário — busca cobrança pelo número de fatura (o "id" pay_xxx
+// não dá pra copiar do painel sandbox no dispositivo do usuário; o número
+// de fatura mostrado no painel é mais fácil de repassar). Remover depois de
+// terminar de depurar o teste de Pix em sandbox.
+app.get("/api/debug/pagamento-por-fatura/:invoiceNumber", async (req, res) => {
+  try {
+    const { data } = await asaas.get(`/payments`, { params: { limit: 20 } });
+    const encontrado = (data.data || []).find(p => String(p.invoiceNumber) === req.params.invoiceNumber);
+    if (!encontrado) return res.status(404).json({ error: "não encontrado nos últimos 20 pagamentos" });
+    res.json({
+      id: encontrado.id,
+      status: encontrado.status,
+      value: encontrado.value,
+      billingType: encontrado.billingType,
+      paymentDate: encontrado.paymentDate,
+      confirmedDate: encontrado.confirmedDate,
+      externalReference: encontrado.externalReference,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Status do usuário (isPro)
 // ════════════════════════════════════════════════════════════════════════════
