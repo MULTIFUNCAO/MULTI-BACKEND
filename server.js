@@ -397,15 +397,6 @@ app.get("/api/status-pagamento/:id", async (req, res) => {
       status: data.status,
       isPaid: ["RECEIVED", "CONFIRMED"].includes(data.status),
       value:  data.value,
-      // Campos extra temporários pra diagnosticar uma divergência entre o
-      // painel sandbox (mostrando "recebido") e este endpoint (retornando
-      // PENDING) — remover depois de entender a causa.
-      billingType: data.billingType,
-      confirmedDate: data.confirmedDate,
-      paymentDate: data.paymentDate,
-      clientPaymentDate: data.clientPaymentDate,
-      dateCreated: data.dateCreated,
-      dueDate: data.dueDate,
     });
   } catch (e) {
     res.status(500).json({ error: "Erro ao verificar pagamento" });
