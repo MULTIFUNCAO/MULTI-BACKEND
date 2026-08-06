@@ -839,6 +839,91 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// CONFIRMAR SERVIÇO (profissional) — único jeito de gravar
+// pedidos.aceite_formal_profissional_em (trigger trg_lock_aceite_formal_profissional
+// no Postgres barra escrita direta via chave anon, ver
+// supabase_lock_aceite_formal_profissional_migration.sql). É aqui que mora a
+// regra de acesso de verdade: categoria já foi filtrada no mural (frontend),
+// mas plano ativo / valor máximo / cota mensal só valem se checados aqui —
+// o frontend é só UX, quem confia cegamente no client pode ser burlado.
+// ════════════════════════════════════════════════════════════════════════════
+app.post("/api/pedidos/confirmar-servico", async (req, res) => {
+  const { pedidoId, profissionalEmail, dataAgendada } = req.body || {};
+  if (!pedidoId || !profissionalEmail)
+    return res.status(400).json({ error: "dados_incompletos" });
+
+  try {
+    const { data: pedido, error: errPedido } = await supabase
+      .from("pedidos")
+      .select("id,profissional_aceito,valor,status,data_agendada,aceite_formal_profissional_em")
+      .eq("id", pedidoId)
+      .maybeSingle();
+    if (errPedido) throw errPedido;
+    if (!pedido) return res.status(404).json({ error: "pedido_nao_encontrado" });
+    if (pedido.profissional_aceito !== profissionalEmail)
+      return res.status(403).json({ error: "nao_autorizado" });
+
+    // Idempotente: se já confirmou antes (ex.: retry de rede), não conta de novo.
+    if (pedido.aceite_formal_profissional_em) {
+      return res.json({ success: true, aceiteFormalEm: pedido.aceite_formal_profissional_em, jaConfirmado: true });
+    }
+
+    const { data: assinatura, error: errAssinatura } = await supabase
+      .from("assinaturas")
+      .select("plano,status,inicio")
+      .eq("titular_tipo", "usuario")
+      .eq("titular_email", profissionalEmail)
+      .maybeSingle();
+    if (errAssinatura) throw errAssinatura;
+    if (!assinatura || !["trial", "ativa"].includes(assinatura.status))
+      return res.status(403).json({ error: "sem_plano_ativo" });
+
+    const limite = PLANO_LIMITES_USUARIO[assinatura.plano];
+    if (!limite) return res.status(403).json({ error: "sem_plano_ativo" });
+
+    if (limite.valorMaxServico != null && pedido.valor != null && pedido.valor > limite.valorMaxServico) {
+      return res.status(403).json({
+        error: "valor_excede_plano",
+        plano: assinatura.plano,
+        valorMaxServico: limite.valorMaxServico,
+        valorServico: pedido.valor,
+      });
+    }
+
+    if (limite.maxServicosMes != null) {
+      const cicloInicio = cicloAtualInicio(assinatura.inicio);
+      const { count, error: errCount } = await supabase
+        .from("pedidos")
+        .select("id", { count: "exact", head: true })
+        .eq("profissional_aceito", profissionalEmail)
+        .not("aceite_formal_profissional_em", "is", null)
+        .gte("aceite_formal_profissional_em", cicloInicio.toISOString());
+      if (errCount) throw errCount;
+      if ((count || 0) >= limite.maxServicosMes) {
+        return res.status(403).json({
+          error: "quota_excedida",
+          plano: assinatura.plano,
+          maxServicosMes: limite.maxServicosMes,
+          usados: count || 0,
+        });
+      }
+    }
+
+    const updates = { aceite_formal_profissional_em: new Date().toISOString() };
+    if (!pedido.data_agendada && dataAgendada) updates.data_agendada = dataAgendada;
+
+    const { error: errUpdate } = await supabase.from("pedidos").update(updates).eq("id", pedidoId);
+    if (errUpdate) throw errUpdate;
+
+    log("SERVICO CONFIRMADO", { pedidoId, profissionalEmail, plano: assinatura.plano });
+    res.json({ success: true, aceiteFormalEm: updates.aceite_formal_profissional_em });
+  } catch (e) {
+    log("ERRO pedidos/confirmar-servico", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao confirmar serviço" });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // ADMIN — Documentação do profissional (protegido por x-admin-key, mesmo
 // padrão de /api/admin/usuarios). Único jeito de um documento virar
 // "verified"/"rejected" — o trigger trg_lock_doc_status no Postgres também
