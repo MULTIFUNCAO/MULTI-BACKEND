@@ -457,7 +457,7 @@ app.post("/webhook/asaas", async (req, res) => {
 app.get("/api/admin/usuarios", async (req, res) => {
   if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
     return res.status(401).json({ error: "Não autorizado" });
-  const { data } = await supabase.from("users").select("*").order("created_at", { ascending: false });
+  const { data } = await supabase.from("usuarios").select("*").order("created_at", { ascending: false });
   res.json({ total: data?.length || 0, users: data });
 });
 
@@ -1072,27 +1072,43 @@ app.post("/api/cobrar-cartao", async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ADMIN — 2026-08-07: todas as rotas abaixo consultavam "users"/"service_requests",
+// tabelas legadas que o app real (App.jsx) nunca escreve — por isso o painel
+// mostrava tudo zerado mesmo com contas reais. O app grava em "usuarios" e
+// "pedidos" (confirmado direto na API do Supabase); PRO de verdade mora em
+// "assinaturas" (status "ativa"), não em "usuarios.pro_plan" (nunca é setado
+// pelo fluxo atual — ver [[supabase_multifuncao_project]] no histórico do
+// projeto). Ver também [[multi_admin_dashboard_endpoint_mismatch]].
+// ════════════════════════════════════════════════════════════════════════════
+function checkAdminKey(req, res) {
+  if (req.headers["x-admin-key"] !== "multi2026") {
+    res.status(401).json({ error: "Não autorizado" });
+    return false;
+  }
+  return true;
+}
+
 // ── ADMIN STATS ────────────────────────────────────────────
 app.get("/api/admin/stats", async (req, res) => {
-  const key = req.headers["x-admin-key"];
-  if (key !== "multi2026") return res.status(401).json({ error: "Não autorizado" });
+  if (!checkAdminKey(req, res)) return;
   try {
-    const { data: users } = await supabase.from("users").select("is_pro,role,created_at,payment_id");
-    const total = users?.length || 0;
-    const pros = users?.filter(u => u.role === "professional") || [];
-    const clients = users?.filter(u => u.role === "client") || [];
-    const proAtivos = users?.filter(u => u.is_pro) || [];
+    const { data: usuarios } = await supabase.from("usuarios").select("role,created_at");
+    const { data: assinaturas } = await supabase.from("assinaturas").select("status").eq("status", "ativa");
+    const pros = usuarios?.filter(u => u.role === "professional") || [];
+    const clients = usuarios?.filter(u => u.role === "client") || [];
+    const proAtivos = assinaturas?.length || 0;
     const hoje = new Date().toISOString().split("T")[0];
-    const novosHoje = users?.filter(u => u.created_at?.startsWith(hoje)) || [];
-    const mrr = proAtivos.length * 29.90;
+    const novosHoje = usuarios?.filter(u => u.created_at?.startsWith(hoje)) || [];
+    const mrr = proAtivos * 29.90;
     res.json({
-      totalUsers: total,
+      totalUsers: pros.length + clients.length,
       totalPros: pros.length,
       totalClients: clients.length,
-      proAtivos: proAtivos.length,
+      proAtivos,
       mrr: mrr.toFixed(2),
       novosHoje: novosHoje.length,
-      receitaEstimada: (proAtivos.length * 29.90).toFixed(2)
+      receitaEstimada: mrr.toFixed(2)
     });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -1101,24 +1117,22 @@ app.get("/api/admin/stats", async (req, res) => {
 
 // ── ADMIN - ASSINANTES PRO ─────────────────────────────────
 app.get("/api/admin/assinantes-pro", async (req, res) => {
-  const key = req.headers["x-admin-key"];
-  if (key !== "multi2026") return res.status(401).json({ error: "Não autorizado" });
+  if (!checkAdminKey(req, res)) return;
   try {
-    const { data: allUsers } = await supabase.from("users").select("*"); const { error: dbErr } = await supabase.from("users").select("count"); console.log("COUNT ERR:", dbErr); console.log("ALL USERS IS_PRO:", JSON.stringify((allUsers||[]).map(u=>({n:u.name,p:u.is_pro})))); const data = (allUsers||[]).filter(u => u.is_pro);
-    res.json(data || []);
+    const { data: ativas } = await supabase.from("assinaturas").select("*").eq("status", "ativa");
+    res.json(ativas || []);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 app.get('/api/admin/pedidos-hoje', async (req, res) => {
-  const key = req.headers['x-admin-key'];
-  if (key !== 'multi2026') return res.status(401).json({ error: 'Nao autorizado' });
+  if (!checkAdminKey(req, res)) return;
   try {
     const hoje = new Date();
     hoje.setHours(0,0,0,0);
     const { data } = await supabase
-      .from('service_requests')
+      .from('pedidos')
       .select('*')
       .gte('created_at', hoje.toISOString())
       .order('created_at', { ascending: false });
@@ -1127,29 +1141,201 @@ app.get('/api/admin/pedidos-hoje', async (req, res) => {
 });
 
 app.get('/api/admin/receita', async (req, res) => {
-  const key = req.headers['x-admin-key'];
-  if (key !== 'multi2026') return res.status(401).json({ error: 'Nao autorizado' });
+  if (!checkAdminKey(req, res)) return;
   try {
+    // Não existe (ainda) um status "completed"/"concluido" nos pedidos reais —
+    // ver GET /api/admin/financial para a agregação que o painel usa hoje.
     const { data } = await supabase
-      .from('service_requests')
+      .from('pedidos')
       .select('*')
-      .eq('status','completed')
+      .eq('status', 'completed')
       .order('created_at', { ascending: false });
     res.json(data || []);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/admin/clientes', async (req, res) => {
-  const key = req.headers['x-admin-key'];
-  if (key !== 'multi2026') return res.status(401).json({ error: 'Nao autorizado' });
+  if (!checkAdminKey(req, res)) return;
   try {
     const { data } = await supabase
-      .from('users')
+      .from('usuarios')
       .select('*')
-      .eq('user_type','client')
+      .eq('role', 'client')
       .order('created_at', { ascending: false });
     res.json(data || []);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN - PROFISSIONAIS (lista + aprovação) ────────────────
+// "approved" é coluna nova (ver supabase_admin_approved_migration.sql) —
+// default true (fail-open, mesma postura da mitigação em curso no doc gate).
+app.get('/api/admin/professionals', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pros, error } = await supabase
+      .from('usuarios')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at')
+      .eq('role', 'professional')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const emails = (pros || []).map(p => p.email).filter(Boolean);
+    const [{ data: pedidos }, { data: avaliacoes }] = await Promise.all([
+      emails.length
+        ? supabase.from('pedidos').select('profissional_aceito,status,valor').in('profissional_aceito', emails)
+        : Promise.resolve({ data: [] }),
+      emails.length
+        ? supabase.from('avaliacoes').select('avaliado_email,estrelas').in('avaliado_email', emails)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const professionals = (pros || []).map(p => {
+      const seus = (pedidos || []).filter(x => x.profissional_aceito === p.email);
+      const suasAvaliacoes = (avaliacoes || []).filter(x => x.avaliado_email === p.email);
+      const rating = suasAvaliacoes.length
+        ? (suasAvaliacoes.reduce((s, a) => s + (a.estrelas || 0), 0) / suasAvaliacoes.length)
+        : null;
+      return {
+        id: p.id,
+        email: p.email,
+        name: p.name,
+        whatsapp: p.whatsapp,
+        city: p.city,
+        cep: p.cep,
+        categories: p.categoria_servico || [],
+        approved: p.approved !== false, // coluna pode não existir ainda em contas antigas -> trata undefined como aprovado
+        is_pro: !!p.pro_plan,
+        services_count: seus.length,
+        open_services: seus.filter(s => s.status === 'aberto').length,
+        revenue: seus.reduce((s, x) => s + (Number(x.valor) || 0), 0),
+        rating: rating ? Number(rating.toFixed(1)) : null,
+        created_at: p.created_at,
+      };
+    });
+    res.json({ professionals });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/approve-professional', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'id é obrigatório' });
+  const { error } = await supabase.from('usuarios').update({ approved: true }).eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
+  log('PROFISSIONAL APROVADO', { id });
+  res.json({ success: true });
+});
+
+app.post('/api/admin/reject-professional', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'id é obrigatório' });
+  const { error } = await supabase.from('usuarios').update({ approved: false }).eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
+  log('PROFISSIONAL REPROVADO', { id });
+  res.json({ success: true });
+});
+
+// ── ADMIN - SERVIÇOS (lista de pedidos) ───────────────────────
+app.get('/api/admin/services', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase
+      .from('pedidos')
+      .select('id,status,categoria,descricao,valor,cliente_id,cliente_nome,profissional_aceito,profissional_nome,cidade,cep,created_at')
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (error) return res.status(500).json({ error: error.message });
+    const services = (data || []).map(p => ({
+      id: p.id,
+      status: p.status,
+      title: p.descricao ? (p.descricao.length > 80 ? p.descricao.slice(0, 80) + '…' : p.descricao) : p.categoria,
+      client_name: p.cliente_nome || p.cliente_id,
+      professional_name: p.profissional_nome || p.profissional_aceito,
+      location: p.cidade,
+      city: p.cidade,
+      value: p.valor,
+      created_at: p.created_at,
+    }));
+    res.json({ services });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ADMIN - FINANCEIRO ─────────────────────────────────────────
+// Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
+// existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
+// status "concluído"/"pago" nos pedidos reais para somar receita de serviços.
+app.get('/api/admin/financial', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const [{ data: ativas }, { data: pedidosAbertos, count: pendingPayments }] = await Promise.all([
+      supabase.from('assinaturas').select('plano,titular_email,inicio').eq('status', 'ativa'),
+      supabase.from('pedidos').select('id', { count: 'exact', head: true }).eq('status', 'aberto'),
+    ]);
+    const activeSubscriptions = ativas?.length || 0;
+    const proRevenue = activeSubscriptions * 29.90;
+    res.json({
+      totalRevenue: proRevenue.toFixed(2),
+      totalWallets: '0,00',
+      totalWithdrawals: '0,00',
+      proRevenue: proRevenue.toFixed(2),
+      pendingPayments: pendingPayments || 0,
+      activeSubscriptions,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ADMIN - CAMPANHA DE EMAIL (segmentada) ────────────────────
+app.post('/api/admin/send-campaign', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { subject, body, target } = req.body || {};
+  if (!subject || !body) return res.status(400).json({ error: 'Assunto e mensagem são obrigatórios' });
+  try {
+    const { data: usuarios } = await supabase.from('usuarios').select('email,name,role');
+    const { data: pedidos } = await supabase.from('pedidos').select('cliente_id,profissional_aceito');
+    const { data: ativas } = await supabase.from('assinaturas').select('titular_email').eq('status', 'ativa');
+    const clientesComPedido = new Set((pedidos || []).map(p => p.cliente_id).filter(Boolean));
+    const prosComPedido = new Set((pedidos || []).map(p => p.profissional_aceito).filter(Boolean));
+    const emailsPro = new Set((ativas || []).map(a => a.titular_email).filter(Boolean));
+
+    let lista = (usuarios || []).filter(u => u.email);
+    if (target === 'clients') lista = lista.filter(u => u.role === 'client');
+    else if (target === 'professionals') lista = lista.filter(u => u.role === 'professional');
+    else if (target === 'pro') lista = lista.filter(u => emailsPro.has(u.email));
+    else if (target === 'no_close_clients') lista = lista.filter(u => u.role === 'client' && !clientesComPedido.has(u.email));
+    else if (target === 'no_close_pros') lista = lista.filter(u => u.role === 'professional' && !prosComPedido.has(u.email));
+    // target === 'all' (ou ausente): todos os usuários com email
+
+    if (lista.length === 0) return res.status(400).json({ error: 'Nenhum destinatário para esse segmento' });
+
+    let sent = 0, falhas = 0;
+    for (let i = 0; i < lista.length; i += 10) {
+      const lote = lista.slice(i, i + 10);
+      await Promise.allSettled(lote.map(async (dest) => {
+        const firstName = dest.name?.split(' ')[0] || '';
+        const html = `
+          <p style="color:#6B7280;font-size:13px;margin:0 0 4px">Olá, ${firstName}!</p>
+          <div style="color:#555;line-height:1.8;font-size:14px">${body.replace(/\n/g, '<br>')}</div>
+        `;
+        try {
+          await sgMail.send({ to: dest.email, from: FROM, subject, html: layout(html) });
+          sent++;
+        } catch { falhas++; }
+      }));
+      if (i + 10 < lista.length) await new Promise(r => setTimeout(r, 500));
+    }
+
+    log('CAMPANHA ADMIN', { subject, target, sent, falhas, total: lista.length });
+    res.json({ ok: true, sent, falhas, total: lista.length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
