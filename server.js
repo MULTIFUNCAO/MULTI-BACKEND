@@ -698,7 +698,28 @@ app.delete("/api/cartoes/:id", async (req, res) => {
 });
 
 // ── WEBHOOK ASAAS ──────────────────────────────────────────
+// 2026-08-07: até aqui esse endpoint aceitava QUALQUER POST sem checar se
+// veio da Asaas de verdade — achado durante a investigação do painel admin
+// (ver [[multi_admin_dashboard_endpoint_mismatch]]). Asaas manda de volta o
+// token configurado em Configurações > Integrações > Webhooks no header
+// "asaas-access-token" — validamos contra ASAAS_WEBHOOK_TOKEN (setar no
+// Render com o MESMO valor cadastrado lá na Asaas). Fail-closed de propósito:
+// sem a env var setada, rejeita tudo (401) em vez de aceitar tudo — força
+// configurar explicitamente em vez de destravar sozinho.
+//
+// Nota à parte (não é o motivo da validação, mas fica registrado): a lógica
+// abaixo hoje já não teria efeito nenhum mesmo sem essa checagem — ela grava
+// em "users" (tabela morta) e em "pedidos.payment_id"/"phase" (colunas que
+// não existem no schema real). A ativação de PRO de verdade acontece só em
+// ativarAssinatura(), chamada por /api/assinatura/cobrar e /confirmar-pix,
+// que reconferem o pagamento direto na Asaas antes de gravar.
 app.post("/api/webhook-asaas", async (req, res) => {
+  const token = process.env.ASAAS_WEBHOOK_TOKEN;
+  if (!token || req.headers["asaas-access-token"] !== token) {
+    console.warn("[WEBHOOK] Token ausente ou inválido — requisição rejeitada");
+    return res.status(401).json({ error: "Não autorizado" });
+  }
+
   const { event, payment } = req.body;
   console.log("[WEBHOOK]", event, payment?.id);
   if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
@@ -1236,6 +1257,27 @@ app.post('/api/admin/reject-professional', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL REPROVADO', { id });
   res.json({ success: true });
+});
+
+// Cancela uma assinatura manualmente — criada pra limpar as duas linhas
+// "hacker.teste.claude@"/"hacker2.teste.claude@" achadas na investigação de
+// 2026-08-07 (assinaturas "ativa" sem nenhum vínculo com a Asaas, resíduo do
+// teste que provou a vulnerabilidade de RLS já corrigida — ver
+// [[multi_admin_dashboard_endpoint_mismatch]]). Só cancela quem está "ativa"
+// pra não mexer em trial/já cancelada por engano.
+app.post('/api/admin/cancel-subscription', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email é obrigatório' });
+  const { data, error } = await supabase
+    .from('assinaturas')
+    .update({ status: 'cancelada' })
+    .eq('titular_email', email)
+    .eq('status', 'ativa')
+    .select('titular_email,status');
+  if (error) return res.status(500).json({ error: error.message });
+  log('ASSINATURA CANCELADA (admin)', { email, linhasAfetadas: data?.length || 0 });
+  res.json({ success: true, updated: data?.length || 0 });
 });
 
 // ── ADMIN - SERVIÇOS (lista de pedidos) ───────────────────────
