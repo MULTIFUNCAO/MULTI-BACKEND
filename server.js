@@ -563,8 +563,18 @@ app.post("/api/auth/cadastro", async (req, res) => {
     }
     const firstName = name.trim().split(" ")[0];
     await supabase.from("users").upsert({ email, name: firstName, full_name: name, role, auth_id: authData.user.id, is_pro: false }, { onConflict: "email" });
+    // Loga o usuário recém-criado pra já sair com sessão real do Supabase Auth
+    // (mesmo token/refresh_token que /api/auth/login devolve) — sem isso o
+    // front tinha que fazer uma segunda chamada de login logo em seguida.
+    const { data: sessionData, error: sessionError } = await supabase.auth.signInWithPassword({ email, password });
+    if (sessionError) log("AVISO cadastro sem sessao", sessionError.message);
     log("CADASTRO", { email, role });
-    res.json({ ok: true, user: { id: authData.user.id, name: firstName, email, role, isPro: role === "professional" } });
+    res.json({
+      ok: true,
+      token: sessionData?.session?.access_token || null,
+      refresh_token: sessionData?.session?.refresh_token || null,
+      user: { id: authData.user.id, name: firstName, email, role, isPro: role === "professional" },
+    });
   } catch (e) {
     log("ERRO cadastro", e.message);
     res.status(500).json({ error: e.message || "Erro ao criar conta" });
@@ -581,7 +591,7 @@ app.post("/api/auth/login", async (req, res) => {
     if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
     const { data: profile } = await supabase.from("users").select("*").eq("email", email).maybeSingle();
     log("LOGIN", { email });
-    res.json({ ok: true, token: data.session.access_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: profile?.is_pro || false } });
+    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: profile?.is_pro || false } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
