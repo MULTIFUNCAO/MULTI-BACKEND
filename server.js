@@ -753,10 +753,15 @@ const PLANOS_ASSINATURA = {
 // Espelha PLANO_LIMITES_USUARIO em MULTI/src/App.jsx — repos separados, sem
 // pacote compartilhado, então qualquer mudança aqui precisa ser replicada
 // manualmente lá (e vice-versa). null = sem limite (Premium).
+// 2026-08-09: maxCategorias (flat) virou maxGrupos+maxItensPorGrupo (grupo×
+// profissões-por-grupo) — só afeta a UI/copy hoje, este backend nunca
+// aplicou o teto de categoria de fato (só maxServicosMes/valorMaxServico são
+// checados abaixo, no endpoint de confirmação); mantido em sync mesmo assim
+// pra não divergir do front caso um gate real seja adicionado aqui depois.
 const PLANO_LIMITES_USUARIO = {
-  autonomo: { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 600  },
-  pro:      { maxCategorias: 3, maxServicosMes: 10, valorMaxServico: 3000 },
-  premium:  { maxCategorias: null, maxServicosMes: null, valorMaxServico: null },
+  autonomo: { maxGrupos: 1, maxItensPorGrupo: 1, maxServicosMes: 3,  valorMaxServico: 600  },
+  pro:      { maxGrupos: 2, maxItensPorGrupo: 3, maxServicosMes: 10, valorMaxServico: 3000 },
+  premium:  { maxGrupos: null, maxItensPorGrupo: null, maxServicosMes: null, valorMaxServico: null },
 };
 
 // Ciclo de cobrança rolante de 30 dias a partir de assinaturas.inicio — não
