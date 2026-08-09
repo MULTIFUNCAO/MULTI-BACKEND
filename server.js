@@ -12,7 +12,19 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 const allowedOrigins = [process.env.FRONTEND_URL, "https://floragestao.com.br", "https://localhost", "capacitor://localhost", "http://localhost"].filter(Boolean);
-app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : "*" }));
+// Previews do Vercel (deploy de teste do MULTI antes de ir pra produção)
+// ganham uma URL aleatória tipo https://multi-<hash>-anacristinal1401-2650s-projects.vercel.app
+// a cada "vercel deploy" — não dá pra colocar fixo em allowedOrigins. Libera
+// só esse padrão específico do projeto, não *.vercel.app inteiro.
+const previewOriginRegex = /^https:\/\/multi-[a-z0-9]+-anacristinal1401-2650s-projects\.vercel\.app$/;
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // requisições sem Origin (curl, server-to-server)
+    if (!allowedOrigins.length) return callback(null, true);
+    if (allowedOrigins.includes(origin) || previewOriginRegex.test(origin)) return callback(null, true);
+    callback(new Error("Not allowed by CORS"));
+  },
+}));
 app.use(express.json());
 
 // ─── Supabase ────────────────────────────────────────────────────────────────
