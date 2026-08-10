@@ -33,6 +33,27 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Client efêmero, sem estado, só para `auth.signInWithPassword()` (cadastro/
+// login). Incidente 2026-08-10: usar `supabase.auth.signInWithPassword()`
+// nesse client compartilhado acima troca o header Authorization dele pro
+// JWT do usuário comum que acabou de logar — supabase-js escuta o próprio
+// auth state e propaga pro client de REST inteiro. Depois disso, TODO
+// `supabase.from(...)` seguinte (enderecos/cartoes/users/payments, que
+// dependem do service_role pra passar pela RLS "Negar acesso publico") passa
+// a sair autenticado como aquele usuário comum e cai na mesma policy de
+// negação, com "new row violates row-level security policy". Sintoma:
+// funciona só logo após um restart/deploy (client "virgem"), e quebra de
+// novo assim que qualquer pessoa loga ou se cadastra — não é bug de chave
+// nem de RLS, era o client de auth compartilhado sendo "logado" como
+// usuário comum. `persistSession`/`autoRefreshToken` desligados porque esse
+// client só serve pra emitir um sessionData e ser descartado, não precisa
+// manter timers de refresh em segundo plano.
+function supabaseAuthOnly() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
 // ─── SendGrid ────────────────────────────────────────────────────────────────
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const FROM    = "contato@multifuncao.com.br";
@@ -578,7 +599,7 @@ app.post("/api/auth/cadastro", async (req, res) => {
     // Loga o usuário recém-criado pra já sair com sessão real do Supabase Auth
     // (mesmo token/refresh_token que /api/auth/login devolve) — sem isso o
     // front tinha que fazer uma segunda chamada de login logo em seguida.
-    const { data: sessionData, error: sessionError } = await supabase.auth.signInWithPassword({ email, password });
+    const { data: sessionData, error: sessionError } = await supabaseAuthOnly().auth.signInWithPassword({ email, password });
     if (sessionError) log("AVISO cadastro sem sessao", sessionError.message);
     log("CADASTRO", { email, role });
     res.json({
@@ -599,7 +620,7 @@ app.post("/api/auth/login", async (req, res) => {
   if (!email || !password)
     return res.status(400).json({ error: "email e password são obrigatórios" });
   try {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabaseAuthOnly().auth.signInWithPassword({ email, password });
     if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
     const { data: profile } = await supabase.from("users").select("*").eq("email", email).maybeSingle();
     log("LOGIN", { email });
