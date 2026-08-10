@@ -785,6 +785,40 @@ const PLANO_LIMITES_USUARIO = {
   pro:      { maxGrupos: 2, maxItensPorGrupo: 3, maxServicosMes: 10, valorMaxServico: 3000 },
   premium:  { maxGrupos: null, maxItensPorGrupo: null, maxServicosMes: null, valorMaxServico: null },
 };
+// Lê os limites reais de "configuracoes_planos" (fonte única de verdade,
+// compartilhada com o front) em vez do objeto hardcoded acima, que agora só
+// serve de fallback se a leitura falhar (rede, ou o bug de durabilidade
+// desse projeto Supabase). Cache curto pra não bater no banco em toda
+// confirmação de serviço — limites de plano mudam raramente (só quando o
+// admin ajusta), 60s é sobra.
+let _planoLimitesCache = null;
+let _planoLimitesCacheEm = 0;
+const PLANO_LIMITES_CACHE_TTL_MS = 60_000;
+async function getPlanoLimites() {
+  const agora = Date.now();
+  if (_planoLimitesCache && (agora - _planoLimitesCacheEm) < PLANO_LIMITES_CACHE_TTL_MS) {
+    return _planoLimitesCache;
+  }
+  try {
+    const { data, error } = await supabase.from("configuracoes_planos").select("*");
+    if (error || !data?.length) throw error || new Error("configuracoes_planos vazia");
+    const limites = {};
+    for (const row of data) {
+      limites[row.plano] = {
+        maxGrupos: row.max_grupos,
+        maxItensPorGrupo: row.max_itens_por_grupo,
+        maxServicosMes: row.max_servicos_mes,
+        valorMaxServico: row.valor_max_servico,
+      };
+    }
+    _planoLimitesCache = limites;
+    _planoLimitesCacheEm = agora;
+    return limites;
+  } catch (e) {
+    log("AVISO: falha ao ler configuracoes_planos, usando fallback hardcoded", e.message || e);
+    return PLANO_LIMITES_USUARIO;
+  }
+}
 
 // Ciclo de cobrança rolante de 30 dias a partir de assinaturas.inicio — não
 // existe renovação automática/coluna de "última cobrança" ainda (ver aviso
@@ -1017,7 +1051,8 @@ app.post("/api/pedidos/confirmar-servico", async (req, res) => {
     if (!assinatura || !["trial", "ativa"].includes(assinatura.status))
       return res.status(403).json({ error: "sem_plano_ativo" });
 
-    const limite = PLANO_LIMITES_USUARIO[assinatura.plano];
+    const limites = await getPlanoLimites();
+    const limite = limites[assinatura.plano];
     if (!limite) return res.status(403).json({ error: "sem_plano_ativo" });
 
     if (limite.valorMaxServico != null && pedido.valor != null && pedido.valor > limite.valorMaxServico) {
