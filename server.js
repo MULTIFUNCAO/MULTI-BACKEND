@@ -776,14 +776,17 @@ const PLANOS_ASSINATURA = {
 // pacote compartilhado, então qualquer mudança aqui precisa ser replicada
 // manualmente lá (e vice-versa). null = sem limite (Premium).
 // 2026-08-09: maxCategorias (flat) virou maxGrupos+maxItensPorGrupo (grupo×
-// profissões-por-grupo) — só afeta a UI/copy hoje, este backend nunca
-// aplicou o teto de categoria de fato (só maxServicosMes/valorMaxServico são
-// checados abaixo, no endpoint de confirmação); mantido em sync mesmo assim
-// pra não divergir do front caso um gate real seja adicionado aqui depois.
+// profissões-por-grupo). 2026-08-10: voltou a ser flat (maxCategorias) —
+// decisão explícita de manter a reforma comercial separada da reforma de
+// 23 grupos/profissões aninhadas (projeto à parte). Só afeta a UI/copy do
+// front hoje, este backend nunca aplicou o teto de categoria de fato (só
+// maxServicosMes/valorMaxServico são checados abaixo, no endpoint de
+// confirmação); mantido em sync mesmo assim pra não divergir do front caso
+// um gate real seja adicionado aqui depois.
 const PLANO_LIMITES_USUARIO = {
-  autonomo: { maxGrupos: 1, maxItensPorGrupo: 1, maxServicosMes: 3,  valorMaxServico: 600  },
-  pro:      { maxGrupos: 2, maxItensPorGrupo: 3, maxServicosMes: 10, valorMaxServico: 3000 },
-  premium:  { maxGrupos: null, maxItensPorGrupo: null, maxServicosMes: null, valorMaxServico: null },
+  autonomo: { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 5000 },
+  pro:      { maxCategorias: 3, maxServicosMes: 10, valorMaxServico: 5000 },
+  premium:  { maxCategorias: null, maxServicosMes: null, valorMaxServico: null },
 };
 // Lê os limites reais de "configuracoes_planos" (fonte única de verdade,
 // compartilhada com o front) em vez do objeto hardcoded acima, que agora só
@@ -805,8 +808,7 @@ async function getPlanoLimites() {
     const limites = {};
     for (const row of data) {
       limites[row.plano] = {
-        maxGrupos: row.max_grupos,
-        maxItensPorGrupo: row.max_itens_por_grupo,
+        maxCategorias: row.max_categorias,
         maxServicosMes: row.max_servicos_mes,
         valorMaxServico: row.valor_max_servico,
       };
