@@ -764,7 +764,45 @@ app.post("/api/webhook-asaas", async (req, res) => {
   }
 
   const { event, payment } = req.body;
-  console.log("[WEBHOOK]", event, payment?.id);
+  console.log("[WEBHOOK]", event, payment?.id, payment?.subscription || "");
+
+  // Renovação de uma assinatura Multi (Autônomo/Pro/Premium) — a Asaas
+  // cobrou sozinha o ciclo seguinte (ver /api/assinatura/cobrar, que agora
+  // cria a cobrança como POST /subscriptions em vez de /payments avulso).
+  // "payment.subscription" só vem preenchido quando o pagamento pertence a
+  // uma assinatura recorrente — distingue isso de qualquer outro pagamento
+  // avulso que a Asaas possa notificar aqui. Nunca confia em
+  // titular_email/plano vindos do payload do webhook (poderia ser forjado
+  // até aqui, mesmo com o token validado): busca a linha em "assinaturas"
+  // pelo asaas_subscription_id, que é o vínculo real gravado na ativação.
+  if ((event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") && payment?.subscription) {
+    try {
+      const { data: assinatura } = await supabase
+        .from("assinaturas").select("titular_tipo,titular_email")
+        .eq("asaas_subscription_id", payment.subscription).maybeSingle();
+      if (assinatura) {
+        const proximaCobranca = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        await supabase.from("assinaturas").update({
+          status: "ativa",
+          expira_em: proximaCobranca.toISOString(),
+          proxima_cobranca: proximaCobranca.toISOString(),
+          asaas_payment_id: payment.id,
+          // Cortesia só valia pro ciclo 1 (se veio de cupom) — uma cobrança
+          // confirmada aqui é sempre um ciclo pago de verdade.
+          cortesia: false,
+        }).eq("titular_tipo", assinatura.titular_tipo).eq("titular_email", assinatura.titular_email);
+        console.log("[WEBHOOK] Renovação de assinatura confirmada:", payment.subscription, assinatura.titular_email);
+      } else {
+        console.warn("[WEBHOOK] Renovação de uma assinatura sem registro em 'assinaturas':", payment.subscription);
+      }
+    } catch (e) {
+      console.error("[WEBHOOK] Erro ao processar renovação:", e.message || e);
+    }
+  }
+
+  // Lógica antiga abaixo — grava em tabelas mortas ("users"/"pedidos.payment_id"),
+  // nunca teve efeito real (ver nota histórica no topo deste handler), mantida
+  // só pra não quebrar nada que ainda dependa do 200 de resposta.
   if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
     const paymentId = payment?.id;
     if (paymentId) {
@@ -875,7 +913,7 @@ async function buscarOuCriarClienteAsaas({ email, nome, cpf, phone }) {
 // síncrono, dentro do próprio /api/assinatura/cobrar; PIX: assíncrono, só
 // depois que /api/assinatura/confirmar-pix reconfere o status). RLS trava
 // insert/update de "assinaturas" pra service_role (ver comentário acima).
-async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, customerId }) {
+async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, customerId, subscriptionId, cupomCodigo, cortesia }) {
   const inicio = new Date();
   const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
   const { error } = await supabase.from("assinaturas").upsert({
@@ -888,14 +926,80 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
     proxima_cobranca: proximaCobranca.toISOString(),
     asaas_customer_id: customerId,
     asaas_payment_id: paymentId,
+    asaas_subscription_id: subscriptionId || null,
+    cupom_codigo: cupomCodigo || null,
+    cortesia: !!cortesia,
   }, { onConflict: "titular_tipo,titular_email" });
   if (error) throw error;
   return { proximaCobranca };
 }
 
+// ── CUPONS (mês grátis pra quem divulga a plataforma) ───────────────────────
+// Reutilizável de propósito (mesmo código serve pra N profissionais) — ver
+// supabase_cupons_migration.sql. Só vale pro Multi Autônomo, checado tanto
+// aqui (implícito — quem chama já filtra) quanto de novo em
+// /api/assinatura/cobrar antes de aplicar, nunca confia só na UI ter
+// escondido o campo pros outros planos.
+//
+// Retorna { ok:false, motivo } em vez de lançar erro pros casos "normais"
+// (cupom não existe, expirado, já usado...) — são respostas esperadas do dia
+// a dia, não uma falha de sistema; só erro de infra (Supabase fora do ar)
+// deve virar exceção de verdade.
+async function buscarCupomValido(codigoBruto, titularEmail) {
+  const codigo = (codigoBruto || "").trim().toUpperCase();
+  if (!codigo) return { ok: false, motivo: "cupom_vazio" };
+
+  const { data: cupom, error } = await supabase.from("cupons").select("*").eq("codigo", codigo).maybeSingle();
+  if (error) throw error;
+  if (!cupom) return { ok: false, motivo: "cupom_nao_encontrado" };
+  if (!cupom.ativo) return { ok: false, motivo: "cupom_inativo" };
+  if (cupom.expira_em && new Date(cupom.expira_em) < new Date()) return { ok: false, motivo: "cupom_expirado" };
+  if (cupom.usos_maximos != null && cupom.usos_count >= cupom.usos_maximos) return { ok: false, motivo: "cupom_esgotado" };
+
+  const { data: usoExistente, error: errUso } = await supabase
+    .from("cupons_usados").select("id").eq("cupom_id", cupom.id).eq("titular_email", titularEmail).maybeSingle();
+  if (errUso) throw errUso;
+  if (usoExistente) return { ok: false, motivo: "cupom_ja_usado" };
+
+  return { ok: true, cupom };
+}
+
+// Registra o uso (insert em cupons_usados + incrementa cupons.usos_count) —
+// só chamado DEPOIS que a assinatura já foi ativada de verdade em
+// ativarAssinatura(), nunca antes: se o resto da ativação falhar no meio, o
+// cupom não é "gasto" à toa. O unique(cupom_id, titular_email) em
+// cupons_usados é a trava definitiva contra reuso mesmo sob corrida — este
+// try/catch aqui é só pra transformar a violação de unique numa mensagem
+// legível, buscarCupomValido() acima já é quem faz a checagem "no caminho feliz".
+async function registrarUsoCupom(cupom, titularEmail) {
+  const { error } = await supabase.from("cupons_usados").insert({ cupom_id: cupom.id, titular_email: titularEmail });
+  if (error) {
+    if (error.code === "23505") throw new Error("cupom_ja_usado"); // unique violation
+    throw error;
+  }
+  await supabase.from("cupons").update({ usos_count: cupom.usos_count + 1 }).eq("id", cupom.id);
+}
+
+// Validação "leve" pro front dar feedback instantâneo assim que a pessoa
+// digita o cupom em EscolherPlanoScreen — NÃO consome o cupom (só
+// buscarCupomValido, sem registrarUsoCupom). A validação que decide de
+// verdade se ativa o plano de graça acontece de novo, do zero, dentro de
+// /api/assinatura/cobrar — esta rota aqui é só UX, nunca autoriza nada sozinha.
+app.post("/api/assinatura/validar-cupom", async (req, res) => {
+  const { cupom, titularEmail } = req.body || {};
+  if (!titularEmail) return res.status(400).json({ error: "titularEmail obrigatório" });
+  try {
+    const resultado = await buscarCupomValido(cupom, titularEmail);
+    res.json(resultado.ok ? { valido: true, tipo: resultado.cupom.tipo } : { valido: false, motivo: resultado.motivo });
+  } catch (e) {
+    log("ERRO validar-cupom", e.message || e);
+    res.status(500).json({ error: "Erro ao validar cupom" });
+  }
+});
+
 app.post("/api/assinatura/cobrar", async (req, res) => {
   const {
-    titularTipo, titularEmail, titularNome, plano,
+    titularTipo, titularEmail, titularNome, plano, cupom,
     cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, phone,
   } = req.body || {};
 
@@ -910,16 +1014,42 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
   if (!titularEmail || !cardNumber || !cardHolder || !expiryMonth || !expiryYear || !cvv || !cpf)
     return res.status(400).json({ error: "Dados de pagamento incompletos" });
 
+  // Cupom só vale pro Multi Autônomo — mandar cupom junto de outro plano é
+  // rejeitado explicitamente em vez de silenciosamente cobrar normal (evita
+  // o "testei o cupom e não fez nada, será que tá quebrado?").
+  if (cupom && plano !== "autonomo")
+    return res.status(400).json({ error: "Cupom vale apenas para o Multi Autônomo" });
+
   try {
+    // Revalida o cupom do zero aqui (nunca confia no /validar-cupom anterior
+    // — pode ter expirado/esgotado/sido usado nesse intervalo) e só marca
+    // "usado" depois que a assinatura ativar de verdade, lá embaixo.
+    let cupomValidado = null;
+    if (cupom) {
+      const resultado = await buscarCupomValido(cupom, titularEmail);
+      if (!resultado.ok) return res.status(400).json({ error: "cupom_invalido", motivo: resultado.motivo });
+      cupomValidado = resultado.cupom;
+    }
+
     const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
 
-    // Cobrança do primeiro mês — cartão de crédito, síncrono (mesmo padrão
-    // testado em /api/cobrar-cartao). Renovação automática do mês seguinte
-    // ainda NÃO está automatizada aqui (precisaria da Asaas Subscriptions
-    // API ou de um job agendado) — ver aviso no retorno.
-    const pay = await asaas.post("/payments", {
+    // A cobrança agora cria uma ASSINATURA de verdade na Asaas (POST
+    // /subscriptions), não um pagamento avulso (POST /payments) como era
+    // antes — é a própria Asaas quem cobra o mês 2, 3, 4... sozinha, no
+    // ciclo MONTHLY, sem precisar guardar cartão nem rodar cron aqui (ver
+    // renovação no webhook /api/webhook-asaas, evento PAYMENT_CONFIRMED com
+    // "subscription" preenchido). Com cupom válido, nextDueDate vai pra
+    // daqui a 30 dias — pula a cobrança do ciclo 1 (cortesia); sem cupom,
+    // nextDueDate é hoje, cobra na hora, como sempre foi.
+    const hoje = new Date();
+    const dataInicioCobranca = cupomValidado
+      ? new Date(hoje.getTime() + 30 * 24 * 60 * 60 * 1000)
+      : hoje;
+
+    const sub = await asaas.post("/subscriptions", {
       customer: customerId, billingType: "CREDIT_CARD", value: planoInfo.valor,
-      dueDate: new Date().toISOString().split("T")[0],
+      nextDueDate: dataInicioCobranca.toISOString().split("T")[0],
+      cycle: "MONTHLY",
       creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
       creditCardHolderInfo: {
         name: cardHolder, email: titularEmail, cpfCnpj: cpf,
@@ -929,20 +1059,43 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
       description: `${planoInfo.label} — assinatura mensal`,
     });
 
-    if (!["CONFIRMED", "RECEIVED"].includes(pay.data.status)) {
-      log("ASSINATURA COBRANCA PENDENTE", { titularEmail, plano, status: pay.data.status, paymentId: pay.data.id });
-      return res.status(402).json({ error: "Pagamento não confirmado", status: pay.data.status });
+    let paymentId = null;
+    if (!cupomValidado) {
+      // Sem cupom: a Asaas cobra o ciclo 1 na hora, junto da criação da
+      // assinatura. Confere de verdade se essa cobrança confirmou antes de
+      // liberar o plano — a resposta de POST /subscriptions é só o objeto
+      // da assinatura (sempre "sucesso" ali), o status real de pagamento
+      // está no primeiro item de /payments?subscription=<id>.
+      const { data: pagamentos } = await asaas.get(`/payments?subscription=${sub.data.id}&limit=1`);
+      const primeiroPagamento = pagamentos?.data?.[0];
+      if (!primeiroPagamento || !["CONFIRMED", "RECEIVED"].includes(primeiroPagamento.status)) {
+        log("ASSINATURA COBRANCA PENDENTE", { titularEmail, plano, status: primeiroPagamento?.status, subscriptionId: sub.data.id });
+        // Desfaz a assinatura recém-criada na Asaas — sem isso ela ficaria
+        // órfã lá (cobrando nos próximos ciclos) sem nunca ter sido ativada
+        // aqui, sujeira grave numa integração de cobrança recorrente.
+        await asaas.delete(`/subscriptions/${sub.data.id}`).catch(() => {});
+        return res.status(402).json({ error: "Pagamento não confirmado", status: primeiroPagamento?.status });
+      }
+      paymentId = primeiroPagamento.id;
     }
 
-    const { proximaCobranca } = await ativarAssinatura({ titularTipo, titularEmail, plano, paymentId: pay.data.id, customerId });
+    const { proximaCobranca } = await ativarAssinatura({
+      titularTipo, titularEmail, plano, paymentId, customerId,
+      subscriptionId: sub.data.id,
+      cupomCodigo: cupomValidado?.codigo || null,
+      cortesia: !!cupomValidado,
+    });
 
-    log("ASSINATURA ATIVADA", { titularEmail, plano, paymentId: pay.data.id });
+    if (cupomValidado) await registrarUsoCupom(cupomValidado, titularEmail);
+
+    log(cupomValidado ? "ASSINATURA ATIVADA (CORTESIA CUPOM)" : "ASSINATURA ATIVADA", { titularEmail, plano, subscriptionId: sub.data.id, cupom: cupomValidado?.codigo });
     res.json({
       success: true,
       status: "ativa",
+      cortesia: !!cupomValidado,
       valor: planoInfo.valor,
       proximaCobranca: proximaCobranca.toISOString(),
-      paymentId: pay.data.id,
+      subscriptionId: sub.data.id,
     });
   } catch (e) {
     log("ERRO assinatura/cobrar", e.response?.data || e.message || e);
@@ -1269,6 +1422,64 @@ app.get('/api/admin/clientes', async (req, res) => {
       .eq('role', 'client')
       .order('created_at', { ascending: false });
     res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — CUPONS (mês grátis pra quem divulga a plataforma) ───────────────
+// Ver supabase_cupons_migration.sql / buscarCupomValido() / registrarUsoCupom()
+// acima. Criação e ativação/desativação são as únicas mudanças de cupom que
+// o admin faz por aqui — não existe edição de código/tipo (trocar o código de
+// um cupom já divulgado quebraria quem já tem o texto salvo; desativar e
+// criar um novo é o caminho certo).
+app.get('/api/admin/cupons', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from('cupons').select('*').order('criado_em', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ cupons: data || [] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/cupons', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { codigo, tipo, expiraEm, usosMaximos } = req.body || {};
+  if (!codigo || !codigo.trim()) return res.status(400).json({ error: 'Código obrigatório' });
+  try {
+    const { data, error } = await supabase.from('cupons').insert({
+      codigo: codigo.trim().toUpperCase(),
+      tipo: tipo || 'mes_gratis_autonomo',
+      expira_em: expiraEm || null,
+      usos_maximos: usosMaximos === '' || usosMaximos == null ? null : Number(usosMaximos),
+    }).select().maybeSingle();
+    if (error) {
+      // 23505 = unique violation (código já existe)
+      return res.status(400).json({ error: error.code === '23505' ? 'Já existe um cupom com esse código' : error.message });
+    }
+    res.json({ cupom: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Único campo editável por aqui é "ativo" — ligar/desligar o cupom sem
+// apagar o histórico de quem já usou (cupons_usados referencia cupom_id).
+app.patch('/api/admin/cupons/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { ativo } = req.body || {};
+  if (typeof ativo !== 'boolean') return res.status(400).json({ error: "Campo 'ativo' (boolean) obrigatório" });
+  try {
+    const { data, error } = await supabase.from('cupons').update({ ativo }).eq('id', req.params.id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Cupom não encontrado' });
+    res.json({ cupom: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/cupons/:id/usos', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase
+      .from('cupons_usados').select('*').eq('cupom_id', req.params.id).order('usado_em', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ usos: data || [] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
