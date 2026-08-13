@@ -1775,6 +1775,41 @@ app.get('/api/admin/professionals', async (req, res) => {
 // reconstruir um "extrato" local é impossível pra quem já renovou antes de
 // hoje. A Asaas já tem o histórico completo de verdade (é o processador
 // real) — busca direto de lá em vez de tentar montar isso no banco.
+// ── ADMIN — Busca direta na Asaas por email (fora do Supabase) ────────────
+// 2026-08-13: achado real — RENATO (renatofonseca794@gmail.com) pagou de
+// verdade (log "ASSINATURA ATIVADA" confirma que ativarAssinatura() gravou
+// com sucesso na hora), mas a linha em "assinaturas" sumiu depois sozinha
+// (bug de durabilidade do Supabase desse projeto, já documentado — ver
+// memória — agora confirmado batendo numa tabela de receita, não só
+// cosmética). Esse endpoint existe pra reconstruir a assinatura de alguém
+// usando a Asaas como fonte de verdade, sem depender do Supabase pra achar
+// os IDs (customerId/subscriptionId) — útil tanto pra restaurar o Renato
+// agora quanto pra auditar futuros casos do mesmo bug.
+app.get('/api/admin/asaas-lookup', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'email é obrigatório' });
+  try {
+    const { data: busca } = await asaas.get(`/customers?email=${encodeURIComponent(email)}`);
+    const customer = busca?.data?.[0] || null;
+    if (!customer) return res.json({ customer: null, subscriptions: [], payments: [] });
+
+    const [{ data: subs }, { data: pays }] = await Promise.all([
+      asaas.get(`/subscriptions?customer=${customer.id}`),
+      asaas.get(`/payments?customer=${customer.id}&limit=50`),
+    ]);
+
+    res.json({
+      customer: { id: customer.id, name: customer.name, email: customer.email, cpfCnpj: customer.cpfCnpj },
+      subscriptions: (subs?.data || []).map(s => ({ id: s.id, status: s.status, value: s.value, cycle: s.cycle, nextDueDate: s.nextDueDate, description: s.description })),
+      payments: (pays?.data || []).map(p => ({ id: p.id, subscription: p.subscription || null, value: p.value, status: p.status, dueDate: p.dueDate, paymentDate: p.paymentDate || p.clientPaymentDate || null, billingType: p.billingType })),
+    });
+  } catch (e) {
+    console.error('[admin/asaas-lookup] erro:', e.response?.data || e.message || e);
+    res.status(500).json({ error: 'Erro ao buscar na Asaas' });
+  }
+});
+
 app.get('/api/admin/professional-payments', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { email } = req.query;
