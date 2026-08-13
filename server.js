@@ -1934,12 +1934,14 @@ app.get('/api/admin/services', async (req, res) => {
 app.get('/api/admin/financial', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const [{ data: ativas }, { data: pedidosAbertos, count: pendingPayments }] = await Promise.all([
+    const [{ data: ativas }, { data: pedidosAbertos, count: pendingPayments }, { data: despesas }] = await Promise.all([
       supabase.from('assinaturas').select('plano,titular_email,inicio').eq('status', 'ativa'),
       supabase.from('pedidos').select('id', { count: 'exact', head: true }).eq('status', 'aberto'),
+      supabase.from('despesas').select('valor'),
     ]);
     const activeSubscriptions = ativas?.length || 0;
     const proRevenue = activeSubscriptions * 29.90;
+    const totalDespesas = (despesas || []).reduce((s, d) => s + (Number(d.valor) || 0), 0);
     res.json({
       totalRevenue: proRevenue.toFixed(2),
       totalWallets: '0,00',
@@ -1947,8 +1949,55 @@ app.get('/api/admin/financial', async (req, res) => {
       proRevenue: proRevenue.toFixed(2),
       pendingPayments: pendingPayments || 0,
       activeSubscriptions,
+      totalDespesas: totalDespesas.toFixed(2),
+      lucroLiquido: (proRevenue - totalDespesas).toFixed(2),
     });
   } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ADMIN — Despesas do negócio (tráfego pago, ferramentas, outros custos) ─
+// Ver supabase_despesas_migration.sql. Só entra aqui, admin lança manual —
+// não existe integração automática com nenhuma plataforma de anúncio ainda.
+app.get('/api/admin/despesas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from('despesas').select('*').order('data', { ascending: false });
+    if (error) throw error;
+    res.json({ despesas: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/despesas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { data: dataDespesa, categoria, descricao, valor } = req.body || {};
+  const valorNum = Number(valor);
+  if (!categoria || !valorNum || valorNum <= 0) {
+    return res.status(400).json({ error: 'categoria e valor (> 0) são obrigatórios' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('despesas')
+      .insert({ categoria, descricao: descricao || null, valor: valorNum, ...(dataDespesa ? { data: dataDespesa } : {}) })
+      .select().single();
+    if (error) throw error;
+    log('DESPESA LANÇADA', { categoria, valor: valorNum });
+    res.json({ despesa: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/despesas/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { error } = await supabase.from('despesas').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
