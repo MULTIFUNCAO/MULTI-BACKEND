@@ -7,6 +7,7 @@ require("dotenv").config();
 const express  = require("express");
 const axios    = require("axios");
 const cors     = require("cors");
+const crypto   = require("crypto");
 const sgMail   = require("@sendgrid/mail");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -1421,14 +1422,58 @@ app.post("/api/cobrar-cartao", async (req, res) => {
 // "assinaturas" (status "ativa"), não em "usuarios.pro_plan" (nunca é setado
 // pelo fluxo atual — ver [[supabase_multifuncao_project]] no histórico do
 // projeto). Ver também [[multi_admin_dashboard_endpoint_mismatch]].
+//
+// 2026-08-13: a senha do Admin Panel geral morava hardcoded ("multi2026")
+// tanto aqui quanto no frontend (AdminDashboard.jsx), que mandava ela crua
+// em todo request via header x-admin-key — ou seja, a senha real ficava
+// exposta no bundle JS pra qualquer um que abrisse o dev tools. Trocado por
+// login por token: POST /api/admin/senha real (ADMIN_PASSWORD, só no
+// servidor) devolve um token assinado (HMAC com ADMIN_TOKEN_SECRET, também
+// só no servidor, expira em 24h); o frontend nunca mais guarda a senha, só
+// o token.
 // ════════════════════════════════════════════════════════════════════════════
+function signAdminToken() {
+  const exp = Date.now() + 1000 * 60 * 60 * 24; // 24h
+  const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+  const sig = crypto.createHmac("sha256", process.env.ADMIN_TOKEN_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifyAdminToken(token) {
+  if (!process.env.ADMIN_TOKEN_SECRET || typeof token !== "string") return false;
+  const [payload, sig] = token.split(".");
+  if (!payload || !sig) return false;
+  const expected = crypto.createHmac("sha256", process.env.ADMIN_TOKEN_SECRET).update(payload).digest("base64url");
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expected);
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString()).exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
 function checkAdminKey(req, res) {
-  if (req.headers["x-admin-key"] !== "multi2026") {
+  if (!verifyAdminToken(req.headers["x-admin-key"])) {
     res.status(401).json({ error: "Não autorizado" });
     return false;
   }
   return true;
 }
+
+// POST /api/admin/login — única rota que vê a senha real (ADMIN_PASSWORD,
+// env var só do servidor, nunca enviada ao bundle do frontend).
+app.post("/api/admin/login", (req, res) => {
+  if (!process.env.ADMIN_PASSWORD || !process.env.ADMIN_TOKEN_SECRET) {
+    return res.status(500).json({ error: "Admin login não configurado no servidor" });
+  }
+  const { password } = req.body || {};
+  if (password !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Senha incorreta" });
+  }
+  res.json({ token: signAdminToken() });
+});
 
 // ── ADMIN STATS ────────────────────────────────────────────
 app.get("/api/admin/stats", async (req, res) => {
