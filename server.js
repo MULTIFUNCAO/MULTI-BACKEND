@@ -1579,12 +1579,33 @@ app.get('/api/admin/professionals', async (req, res) => {
   try {
     const { data: pros, error } = await supabase
       .from('usuarios')
-      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at,doc_rg_url,doc_rg_url_verso,analise_ia_status,analise_ia_observacoes')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at')
       .eq('role', 'professional')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
     const emails = (pros || []).map(p => p.email).filter(Boolean);
+
+    // doc_rg_url/doc_rg_url_verso/analise_ia_* são colunas mais novas e já
+    // sumiram sozinhas uma vez nesse projeto Supabase (bug de durabilidade
+    // documentado — ver supabase_multifuncao_project na memória). Busca à
+    // parte, best-effort: se falhar (coluna sumiu de novo), a lista de
+    // profissionais e o botão Aprovar/Reprovar continuam funcionando, só
+    // sem foto/parecer da IA no card — não pode a lista inteira cair por
+    // causa de um campo informativo.
+    let docMap = {};
+    if (emails.length) {
+      const { data: docs, error: docsErr } = await supabase
+        .from('usuarios')
+        .select('email,doc_rg_url,doc_rg_url_verso,analise_ia_status,analise_ia_observacoes')
+        .in('email', emails);
+      if (docsErr) {
+        console.error('[admin/professionals] doc/IA indisponível (segue sem):', docsErr.message);
+      } else {
+        docMap = Object.fromEntries((docs || []).map(d => [d.email, d]));
+      }
+    }
+
     const [{ data: pedidos }, { data: avaliacoes }] = await Promise.all([
       emails.length
         ? supabase.from('pedidos').select('profissional_aceito,status,valor').in('profissional_aceito', emails)
@@ -1595,6 +1616,7 @@ app.get('/api/admin/professionals', async (req, res) => {
     ]);
 
     const professionals = (pros || []).map(p => {
+      const docInfo = docMap[p.email] || {};
       const seus = (pedidos || []).filter(x => x.profissional_aceito === p.email);
       const suasAvaliacoes = (avaliacoes || []).filter(x => x.avaliado_email === p.email);
       const rating = suasAvaliacoes.length
@@ -1609,10 +1631,10 @@ app.get('/api/admin/professionals', async (req, res) => {
         cep: p.cep,
         categories: p.categoria_servico || [],
         approved: p.approved !== false, // undefined (coluna sumiu por bug de durabilidade) -> fail-open, não trata como reprovado
-        docRgUrl: p.doc_rg_url || null,
-        docRgUrlVerso: p.doc_rg_url_verso || null,
-        iaStatus: p.analise_ia_status || null,
-        iaObservacoes: p.analise_ia_observacoes || null,
+        docRgUrl: docInfo.doc_rg_url || null,
+        docRgUrlVerso: docInfo.doc_rg_url_verso || null,
+        iaStatus: docInfo.analise_ia_status || null,
+        iaObservacoes: docInfo.analise_ia_observacoes || null,
         is_pro: !!p.pro_plan,
         services_count: seus.length,
         open_services: seus.filter(s => s.status === 'aberto').length,
@@ -1633,8 +1655,15 @@ app.post('/api/admin/approve-professional', async (req, res) => {
   if (!id) return res.status(400).json({ error: 'id é obrigatório' });
   // doc_rg_status junto com approved: mantém o badge que o profissional vê
   // no próprio Perfil (Pendente/Em análise/Verificado) coerente com a
-  // decisão real do admin, sem precisar de UI nova pra isso.
-  const { error } = await supabase.from('usuarios').update({ approved: true, doc_rg_status: 'verified' }).eq('id', id);
+  // decisão real do admin, sem precisar de UI nova pra isso. Se a coluna
+  // sumir de novo (bug de durabilidade já visto nesse projeto), não pode
+  // travar a aprovação em si — approved é o gate real, doc_rg_status é só
+  // sincronização de badge.
+  let { error } = await supabase.from('usuarios').update({ approved: true, doc_rg_status: 'verified' }).eq('id', id);
+  if (error) {
+    console.error('[approve-professional] doc_rg_status indisponível, gravando só approved:', error.message);
+    ({ error } = await supabase.from('usuarios').update({ approved: true }).eq('id', id));
+  }
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL APROVADO', { id });
   res.json({ success: true });
@@ -1644,7 +1673,11 @@ app.post('/api/admin/reject-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
   if (!id) return res.status(400).json({ error: 'id é obrigatório' });
-  const { error } = await supabase.from('usuarios').update({ approved: false, doc_rg_status: 'rejected' }).eq('id', id);
+  let { error } = await supabase.from('usuarios').update({ approved: false, doc_rg_status: 'rejected' }).eq('id', id);
+  if (error) {
+    console.error('[reject-professional] doc_rg_status indisponível, gravando só approved:', error.message);
+    ({ error } = await supabase.from('usuarios').update({ approved: false }).eq('id', id));
+  }
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL REPROVADO', { id });
   res.json({ success: true });
