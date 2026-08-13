@@ -554,6 +554,73 @@ app.post('/api/ia-chat', async (req, res) => {
   }
 });
 
+// ─── Pré-checagem por IA do documento (RG/CNH) ───────────────────────────────
+// Disparado pelo próprio frontend (handleFileSelect em App.jsx) logo depois
+// que o profissional envia o RG/CNH e o arquivo já está público no Storage.
+// Só dá um PARECER pro admin revisar no painel Multi Admin — nunca aprova
+// sozinho, nunca toca a coluna "approved" (só approve-professional/
+// reject-professional fazem isso). Se a IA falhar por qualquer motivo,
+// responde 200 {success:false} — a revisão humana continua funcionando sem
+// o apoio da IA, não pode travar o cadastro do profissional.
+app.post('/api/documentos/analisar-ia', async (req, res) => {
+  const { email, url } = req.body || {};
+  if (!email || !url) return res.status(400).json({ error: 'email e url são obrigatórios' });
+  const key = process.env.ANTHROPIC_KEY;
+  if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
+
+  // PDF não entra nesta primeira versão (precisaria de um content block de
+  // documento em vez de imagem) — não derruba o fluxo, só não gera parecer.
+  if (/\.pdf($|\?)/i.test(url)) {
+    return res.json({ success: false, error: 'Análise por IA não cobre PDF ainda' });
+  }
+
+  const prompt = `Você está revisando um documento de identidade (RG ou CNH) enviado por um profissional se cadastrando numa plataforma de serviços brasileira. Analise a imagem e responda:
+1. É de fato um documento de identidade (RG ou CNH) legível?
+2. Está cortado, borrado, ou parece print de tela / foto de outra foto (baixa qualidade, reflexo de tela, moiré)?
+3. Se der pra ler, qual o nome completo no documento?
+
+Responda SOMENTE em JSON válido, sem markdown, sem texto fora do JSON:
+{"status": "ok" | "suspeito" | "ilegivel", "nome_extraido": "nome como aparece no documento, ou null se não der pra ler", "observacoes": "1-2 frases curtas explicando o motivo do status, em português, pro admin decidir rápido"}
+
+Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ilegivel" quando não der pra confirmar nem que é um documento de identidade. Use "suspeito" pra qualquer coisa no meio — corte, borrão leve, indício de print de tela, foto de foto, ou qualquer sinal de possível adulteração.`;
+
+  try {
+    const r = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'url', url } },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      },
+      { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 25000 }
+    );
+    const txt = r.data?.content?.[0]?.text || '{}';
+    const match = txt.match(/\{[\s\S]*\}/);
+    const parsed = match ? JSON.parse(match[0]) : {};
+    const status = ['ok', 'suspeito', 'ilegivel'].includes(parsed.status) ? parsed.status : 'suspeito';
+    const observacoes = typeof parsed.observacoes === 'string' ? parsed.observacoes.slice(0, 500) : '';
+
+    const { error } = await supabase.from('usuarios').update({
+      analise_ia_status: status,
+      analise_ia_observacoes: observacoes,
+      analise_ia_em: new Date().toISOString(),
+    }).eq('email', email);
+    if (error) throw error;
+
+    log('DOC ANALISADO POR IA', { email, status });
+    res.json({ success: true, status, observacoes });
+  } catch (e) {
+    console.error('[analisar-ia] Erro:', e.message);
+    res.status(200).json({ success: false, error: 'IA indisponível no momento' });
+  }
+});
+
 // ─── Webhook Asaas ───────────────────────────────────────────────────────────
 app.post('/api/webhook/asaas', (req, res) => {
   const { event, payment } = req.body;
@@ -1484,14 +1551,20 @@ app.get('/api/admin/cupons/:id/usos', async (req, res) => {
 });
 
 // ── ADMIN - PROFISSIONAIS (lista + aprovação) ────────────────
-// "approved" é coluna nova (ver supabase_admin_approved_migration.sql) —
-// default true (fail-open, mesma postura da mitigação em curso no doc gate).
+// "approved" (ver supabase_aprovacao_profissional_ia_migration.sql) agora é
+// o único gate real de verdade — default false pra cadastro novo, reforçado
+// nos triggers trg_block_online_sem_docs/trg_block_proposta_sem_docs no
+// Postgres. approve-professional/reject-professional abaixo são a ÚNICA via
+// legítima de mudar isso (trigger trg_lock_approved bloqueia escrita direta
+// do client). doc_rg_url + analise_ia_status/observacoes (pré-checagem por
+// IA, ver /api/documentos/analisar-ia) vão junto pro painel mostrar o
+// documento e o parecer da IA antes do admin decidir.
 app.get('/api/admin/professionals', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { data: pros, error } = await supabase
       .from('usuarios')
-      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at,doc_rg_url,analise_ia_status,analise_ia_observacoes')
       .eq('role', 'professional')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
@@ -1520,7 +1593,10 @@ app.get('/api/admin/professionals', async (req, res) => {
         city: p.city,
         cep: p.cep,
         categories: p.categoria_servico || [],
-        approved: p.approved !== false, // coluna pode não existir ainda em contas antigas -> trata undefined como aprovado
+        approved: p.approved !== false, // undefined (coluna sumiu por bug de durabilidade) -> fail-open, não trata como reprovado
+        docRgUrl: p.doc_rg_url || null,
+        iaStatus: p.analise_ia_status || null,
+        iaObservacoes: p.analise_ia_observacoes || null,
         is_pro: !!p.pro_plan,
         services_count: seus.length,
         open_services: seus.filter(s => s.status === 'aberto').length,
@@ -1539,7 +1615,10 @@ app.post('/api/admin/approve-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
   if (!id) return res.status(400).json({ error: 'id é obrigatório' });
-  const { error } = await supabase.from('usuarios').update({ approved: true }).eq('id', id);
+  // doc_rg_status junto com approved: mantém o badge que o profissional vê
+  // no próprio Perfil (Pendente/Em análise/Verificado) coerente com a
+  // decisão real do admin, sem precisar de UI nova pra isso.
+  const { error } = await supabase.from('usuarios').update({ approved: true, doc_rg_status: 'verified' }).eq('id', id);
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL APROVADO', { id });
   res.json({ success: true });
@@ -1549,7 +1628,7 @@ app.post('/api/admin/reject-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
   if (!id) return res.status(400).json({ error: 'id é obrigatório' });
-  const { error } = await supabase.from('usuarios').update({ approved: false }).eq('id', id);
+  const { error } = await supabase.from('usuarios').update({ approved: false, doc_rg_status: 'rejected' }).eq('id', id);
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL REPROVADO', { id });
   res.json({ success: true });
