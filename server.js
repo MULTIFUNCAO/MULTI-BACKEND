@@ -563,26 +563,32 @@ app.post('/api/ia-chat', async (req, res) => {
 // responde 200 {success:false} — a revisão humana continua funcionando sem
 // o apoio da IA, não pode travar o cadastro do profissional.
 app.post('/api/documentos/analisar-ia', async (req, res) => {
-  const { email, url } = req.body || {};
+  const { email, url, urlVerso } = req.body || {};
   if (!email || !url) return res.status(400).json({ error: 'email e url são obrigatórios' });
   const key = process.env.ANTHROPIC_KEY;
   if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
 
   // PDF não entra nesta primeira versão (precisaria de um content block de
   // documento em vez de imagem) — não derruba o fluxo, só não gera parecer.
-  if (/\.pdf($|\?)/i.test(url)) {
+  if (/\.pdf($|\?)/i.test(url) || (urlVerso && /\.pdf($|\?)/i.test(urlVerso))) {
     return res.json({ success: false, error: 'Análise por IA não cobre PDF ainda' });
   }
 
-  const prompt = `Você está revisando um documento de identidade (RG ou CNH) enviado por um profissional se cadastrando numa plataforma de serviços brasileira. Analise a imagem e responda:
-1. É de fato um documento de identidade (RG ou CNH) legível?
+  // RG/CNH exige as duas faces — o frontend só chama esta rota depois que
+  // frente E verso já foram enviados, mas cobre urlVerso ausente também
+  // (chamada antiga/manual com 1 imagem só).
+  const imageBlocks = [{ type: 'image', source: { type: 'url', url } }];
+  if (urlVerso) imageBlocks.push({ type: 'image', source: { type: 'url', url: urlVerso } });
+
+  const prompt = `Você está revisando um documento de identidade (RG ou CNH) enviado por um profissional se cadastrando numa plataforma de serviços brasileira. A primeira imagem é a FRENTE${urlVerso ? " e a segunda é o VERSO" : ""} do documento. Analise ${urlVerso ? "as duas imagens" : "a imagem"} e responda:
+1. É de fato um documento de identidade (RG ou CNH) legível${urlVerso ? " nas duas faces" : ""}?
 2. Está cortado, borrado, ou parece print de tela / foto de outra foto (baixa qualidade, reflexo de tela, moiré)?
 3. Se der pra ler, qual o nome completo no documento?
 
 Responda SOMENTE em JSON válido, sem markdown, sem texto fora do JSON:
 {"status": "ok" | "suspeito" | "ilegivel", "nome_extraido": "nome como aparece no documento, ou null se não der pra ler", "observacoes": "1-2 frases curtas explicando o motivo do status, em português, pro admin decidir rápido"}
 
-Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ilegivel" quando não der pra confirmar nem que é um documento de identidade. Use "suspeito" pra qualquer coisa no meio — corte, borrão leve, indício de print de tela, foto de foto, ou qualquer sinal de possível adulteração.`;
+Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ilegivel" quando não der pra confirmar nem que é um documento de identidade. Use "suspeito" pra qualquer coisa no meio — corte, borrão leve, indício de print de tela, foto de foto, face faltando, ou qualquer sinal de possível adulteração.`;
 
   try {
     const r = await axios.post(
@@ -592,10 +598,7 @@ Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ile
         max_tokens: 500,
         messages: [{
           role: 'user',
-          content: [
-            { type: 'image', source: { type: 'url', url } },
-            { type: 'text', text: prompt },
-          ],
+          content: [...imageBlocks, { type: 'text', text: prompt }],
         }],
       },
       { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 25000 }
@@ -1564,7 +1567,7 @@ app.get('/api/admin/professionals', async (req, res) => {
   try {
     const { data: pros, error } = await supabase
       .from('usuarios')
-      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at,doc_rg_url,analise_ia_status,analise_ia_observacoes')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at,doc_rg_url,doc_rg_url_verso,analise_ia_status,analise_ia_observacoes')
       .eq('role', 'professional')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
@@ -1595,6 +1598,7 @@ app.get('/api/admin/professionals', async (req, res) => {
         categories: p.categoria_servico || [],
         approved: p.approved !== false, // undefined (coluna sumiu por bug de durabilidade) -> fail-open, não trata como reprovado
         docRgUrl: p.doc_rg_url || null,
+        docRgUrlVerso: p.doc_rg_url_verso || null,
         iaStatus: p.analise_ia_status || null,
         iaObservacoes: p.analise_ia_observacoes || null,
         is_pro: !!p.pro_plan,
