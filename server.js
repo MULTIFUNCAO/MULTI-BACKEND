@@ -1826,8 +1826,23 @@ app.get('/api/admin/asaas-lookup', async (req, res) => {
 // Limitação conhecida: só olha os últimos `dias` dias (default 90) e até
 // 100 pagamentos por status — auditoria pontual pra hoje, não pensada pra
 // escala; se o volume crescer bastante, precisa de paginação de verdade.
+//
+// Auth de escopo mínimo: além do token de admin normal (painel), aceita
+// também RECONCILIACAO_API_KEY via header x-reconciliacao-key — pensado pra
+// rotina agendada (Claude Code cloud routine) rodar isso sozinha 1x/semana
+// sem precisar guardar a senha mestra do Admin Panel numa config de terceiro
+// (2026-08-13). Essa chave só abre ESSE endpoint — nunca aprova
+// profissional, nunca mexe em dado nenhum, é estritamente leitura.
+function checkReconciliacaoAuth(req, res) {
+  const chaveEscopo = req.headers['x-reconciliacao-key'];
+  if (chaveEscopo && process.env.RECONCILIACAO_API_KEY && chaveEscopo === process.env.RECONCILIACAO_API_KEY) {
+    return true;
+  }
+  return checkAdminKey(req, res);
+}
+
 app.get('/api/admin/reconciliacao-assinaturas', async (req, res) => {
-  if (!checkAdminKey(req, res)) return;
+  if (!checkReconciliacaoAuth(req, res)) return;
   const dias = Math.max(1, Number(req.query.dias) || 90);
   try {
     const desde = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
