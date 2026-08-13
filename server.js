@@ -563,10 +563,22 @@ app.post('/api/ia-chat', async (req, res) => {
 // responde 200 {success:false} — a revisão humana continua funcionando sem
 // o apoio da IA, não pode travar o cadastro do profissional.
 app.post('/api/documentos/analisar-ia', async (req, res) => {
-  const { email, url, urlVerso } = req.body || {};
-  if (!email || !url) return res.status(400).json({ error: 'email e url são obrigatórios' });
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email é obrigatório' });
   const key = process.env.ANTHROPIC_KEY;
   if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
+
+  // Busca as URLs (frente/verso) aqui no backend, pelo client de
+  // service_role — o frontend só manda o email. Evita uma segunda consulta
+  // ao Supabase no navegador logo depois do upload, que travou sem erro
+  // nenhum em teste (mesma família do bug de lock do supabase-js já visto
+  // no login desse projeto).
+  const { data: userRow, error: fetchErr } = await supabase.from('usuarios')
+    .select('doc_rg_url, doc_rg_url_verso').eq('email', email).maybeSingle();
+  if (fetchErr) return res.status(200).json({ success: false, error: fetchErr.message });
+  const url = userRow?.doc_rg_url;
+  const urlVerso = userRow?.doc_rg_url_verso;
+  if (!url) return res.status(200).json({ success: false, error: 'doc_rg_url não encontrado pra esse email' });
 
   // PDF não entra nesta primeira versão (precisaria de um content block de
   // documento em vez de imagem) — não derruba o fluxo, só não gera parecer.
