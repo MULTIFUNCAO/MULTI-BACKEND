@@ -883,6 +883,34 @@ app.post("/api/webhook-asaas", async (req, res) => {
     }
   }
 
+  // 2026-08-13: cobrança de renovação que falhou/venceu — antes disso não
+  // existia NENHUM handler pra esse evento, então uma assinatura cujo cartão
+  // falhasse na renovação ficava "ativa" pra sempre (com proxima_cobranca no
+  // passado, mas nada sinalizando isso em lugar nenhum). Marca "vencida"
+  // (revoga isPro no front — ver App.jsx carregarPlano — e bloqueia limites
+  // de plano no backend, que só aceitam status "ativa"/"trial"). Mesmo
+  // lookup por asaas_subscription_id do bloco de renovação acima, mesmo
+  // motivo (nunca confiar em titular_email vindo do payload). Recuperação é
+  // automática: se a Asaas cobrar de novo com sucesso depois, o bloco de
+  // PAYMENT_RECEIVED/CONFIRMED acima já sobrescreve status pra "ativa" de
+  // novo, sem precisar de lógica extra aqui.
+  if (event === "PAYMENT_OVERDUE" && payment?.subscription) {
+    try {
+      const { data: assinatura } = await supabase
+        .from("assinaturas").select("titular_tipo,titular_email")
+        .eq("asaas_subscription_id", payment.subscription).maybeSingle();
+      if (assinatura) {
+        await supabase.from("assinaturas").update({ status: "vencida" })
+          .eq("titular_tipo", assinatura.titular_tipo).eq("titular_email", assinatura.titular_email);
+        console.log("[WEBHOOK] Assinatura marcada vencida:", payment.subscription, assinatura.titular_email);
+      } else {
+        console.warn("[WEBHOOK] PAYMENT_OVERDUE de uma assinatura sem registro em 'assinaturas':", payment.subscription);
+      }
+    } catch (e) {
+      console.error("[WEBHOOK] Erro ao processar PAYMENT_OVERDUE:", e.message || e);
+    }
+  }
+
   // Lógica antiga abaixo — grava em tabelas mortas ("users"/"pedidos.payment_id"),
   // nunca teve efeito real (ver nota histórica no topo deste handler), mantida
   // só pra não quebrar nada que ainda dependa do 200 de resposta.
@@ -1651,14 +1679,24 @@ app.get('/api/admin/professionals', async (req, res) => {
       }
     }
 
-    const [{ data: pedidos }, { data: avaliacoes }] = await Promise.all([
+    const [{ data: pedidos }, { data: avaliacoes }, { data: assinaturas }] = await Promise.all([
       emails.length
         ? supabase.from('pedidos').select('profissional_aceito,status,valor').in('profissional_aceito', emails)
         : Promise.resolve({ data: [] }),
       emails.length
         ? supabase.from('avaliacoes').select('avaliado_email,estrelas').in('avaliado_email', emails)
         : Promise.resolve({ data: [] }),
+      // 2026-08-13: usuarios.pro_plan é coluna morta (nunca setada pelo fluxo
+      // atual — ver [[supabase_multifuncao_project]]). O plano/pagamento real
+      // do profissional mora em "assinaturas" (titular_tipo='usuario'),
+      // nunca consultada aqui antes — o painel achava que ninguém era PRO.
+      emails.length
+        ? supabase.from('assinaturas')
+            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia')
+            .eq('titular_tipo', 'usuario').in('titular_email', emails)
+        : Promise.resolve({ data: [] }),
     ]);
+    const assinaturaMap = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
 
     const professionals = (pros || []).map(p => {
       const docInfo = docMap[p.email] || {};
@@ -1667,6 +1705,25 @@ app.get('/api/admin/professionals', async (req, res) => {
       const rating = suasAvaliacoes.length
         ? (suasAvaliacoes.reduce((s, a) => s + (a.estrelas || 0), 0) / suasAvaliacoes.length)
         : null;
+
+      // paymentStatus: "vencida" é setado de verdade pelo webhook (PAYMENT_OVERDUE,
+      // ver /api/webhook-asaas) a partir de agora. O fallback por data cobre
+      // assinaturas que já estavam vencidas ANTES desse handler existir (nunca
+      // vão receber o webhook de novo pra corrigir status sozinhas).
+      const assinatura = assinaturaMap[p.email] || null;
+      let plano = null, paymentStatus = 'sem_plano';
+      if (assinatura) {
+        plano = assinatura.plano || null;
+        const proximaCobranca = assinatura.proxima_cobranca ? new Date(assinatura.proxima_cobranca).getTime() : null;
+        if (assinatura.status === 'cancelada') paymentStatus = 'cancelado';
+        else if (assinatura.status === 'vencida') paymentStatus = 'vencido';
+        else if (assinatura.status === 'ativa' || assinatura.status === 'trial') {
+          paymentStatus = (proximaCobranca && proximaCobranca < Date.now()) ? 'vencido' : 'pago';
+        } else {
+          paymentStatus = 'cancelado'; // status desconhecido/futuro — fail-safe, não mostra como "pago"
+        }
+      }
+
       return {
         id: p.id,
         email: p.email,
@@ -1680,7 +1737,11 @@ app.get('/api/admin/professionals', async (req, res) => {
         docRgUrlVerso: docInfo.doc_rg_url_verso || null,
         iaStatus: docInfo.analise_ia_status || null,
         iaObservacoes: docInfo.analise_ia_observacoes || null,
-        is_pro: !!p.pro_plan,
+        plano,
+        paymentStatus,
+        cortesia: !!assinatura?.cortesia,
+        proximaCobranca: assinatura?.proxima_cobranca || null,
+        pro_since: assinatura?.inicio || null,
         services_count: seus.length,
         open_services: seus.filter(s => s.status === 'aberto').length,
         revenue: seus.reduce((s, x) => s + (Number(x.valor) || 0), 0),
