@@ -1755,6 +1755,48 @@ app.get('/api/admin/professionals', async (req, res) => {
   }
 });
 
+// ── ADMIN — Extrato de pagamentos de um profissional ──────────────────────
+// 2026-08-13: "assinaturas" só guarda o ESTADO ATUAL (upsert por
+// titular_tipo+titular_email, 1 linha só — toda renovação sobrescreve a
+// anterior). Não existe ledger de pagamentos passados no Supabase, então
+// reconstruir um "extrato" local é impossível pra quem já renovou antes de
+// hoje. A Asaas já tem o histórico completo de verdade (é o processador
+// real) — busca direto de lá em vez de tentar montar isso no banco.
+app.get('/api/admin/professional-payments', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'email é obrigatório' });
+  try {
+    const { data: assinatura } = await supabase
+      .from('assinaturas')
+      .select('asaas_customer_id')
+      .eq('titular_tipo', 'usuario').eq('titular_email', email).maybeSingle();
+
+    if (!assinatura?.asaas_customer_id) {
+      // Nunca teve assinatura registrada -> nunca virou cliente Asaas de
+      // verdade -> nunca pagou nada. Lista vazia é a resposta correta, não
+      // um erro.
+      return res.json({ payments: [] });
+    }
+
+    const { data } = await asaas.get(`/payments?customer=${assinatura.asaas_customer_id}&limit=50`);
+    const payments = (data?.data || []).map(p => ({
+      id: p.id,
+      value: p.value,
+      status: p.status,
+      billingType: p.billingType,
+      dueDate: p.dueDate,
+      paymentDate: p.paymentDate || p.clientPaymentDate || null,
+      description: p.description || null,
+      invoiceUrl: p.invoiceUrl || null,
+    }));
+    res.json({ payments });
+  } catch (e) {
+    console.error('[admin/professional-payments] erro:', e.response?.data || e.message || e);
+    res.status(500).json({ error: 'Erro ao buscar pagamentos na Asaas' });
+  }
+});
+
 app.post('/api/admin/approve-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
