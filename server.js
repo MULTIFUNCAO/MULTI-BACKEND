@@ -1692,7 +1692,7 @@ app.get('/api/admin/professionals', async (req, res) => {
       // nunca consultada aqui antes — o painel achava que ninguém era PRO.
       emails.length
         ? supabase.from('assinaturas')
-            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia')
+            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia,asaas_customer_id')
             .eq('titular_tipo', 'usuario').in('titular_email', emails)
         : Promise.resolve({ data: [] }),
     ]);
@@ -1710,15 +1710,28 @@ app.get('/api/admin/professionals', async (req, res) => {
       // ver /api/webhook-asaas) a partir de agora. O fallback por data cobre
       // assinaturas que já estavam vencidas ANTES desse handler existir (nunca
       // vão receber o webhook de novo pra corrigir status sozinhas).
+      //
+      // 2026-08-13, achado real (Teste Categoria QA, thyago_santos86 etc.
+      // aparecendo "Pago em dia" sem nunca terem pago nada): status='ativa'
+      // sozinho NÃO é prova de pagamento real — várias linhas em
+      // "assinaturas" foram gravadas direto por SQL/scripts de teste,
+      // pulando ativarAssinatura() (que só roda depois de confirmar o
+      // pagamento na Asaas de verdade). asaas_customer_id só existe quando
+      // passou pelo fluxo real (buscarOuCriarClienteAsaas, chamado de dentro
+      // de ativarAssinatura). "ativa" sem asaas_customer_id E sem cortesia
+      // explícita = nunca teve pagamento nenhum por trás, mesmo "ativa" no
+      // banco — não pode aparecer como "Pago em dia".
       const assinatura = assinaturaMap[p.email] || null;
       let plano = null, paymentStatus = 'sem_plano';
       if (assinatura) {
         plano = assinatura.plano || null;
         const proximaCobranca = assinatura.proxima_cobranca ? new Date(assinatura.proxima_cobranca).getTime() : null;
+        const temVinculoReal = !!assinatura.asaas_customer_id || !!assinatura.cortesia;
         if (assinatura.status === 'cancelada') paymentStatus = 'cancelado';
         else if (assinatura.status === 'vencida') paymentStatus = 'vencido';
         else if (assinatura.status === 'ativa' || assinatura.status === 'trial') {
-          paymentStatus = (proximaCobranca && proximaCobranca < Date.now()) ? 'vencido' : 'pago';
+          if (!temVinculoReal) paymentStatus = 'sem_confirmacao';
+          else paymentStatus = (proximaCobranca && proximaCobranca < Date.now()) ? 'vencido' : 'pago';
         } else {
           paymentStatus = 'cancelado'; // status desconhecido/futuro — fail-safe, não mostra como "pago"
         }
