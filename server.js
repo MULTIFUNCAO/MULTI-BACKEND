@@ -1810,6 +1810,82 @@ app.get('/api/admin/asaas-lookup', async (req, res) => {
   }
 });
 
+// ── ADMIN — Reconciliação Asaas × Supabase ─────────────────────────────────
+// 2026-08-13: nasceu do caso do RENATO — pagamento real confirmado na Asaas,
+// linha em "assinaturas" sumiu sozinha depois (bug de durabilidade do
+// Supabase desse projeto, já documentado, agora confirmado numa tabela de
+// receita). Isso é só AUDITORIA — nunca escreve nada, só relata. Corrigir um
+// caso encontrado é decisão manual (mesmo processo de hoje: buscar os dados
+// reais via /api/admin/asaas-lookup, confirmar com o usuário, só então
+// gravar).
+//
+// Ponto de partida é a ASAAS (não o Supabase) de propósito — um caso como o
+// do Renato é invisível se você só olha o que já está no banco; a única
+// forma de achar "sumiu" é comparar contra quem realmente pagou.
+//
+// Limitação conhecida: só olha os últimos `dias` dias (default 90) e até
+// 100 pagamentos por status — auditoria pontual pra hoje, não pensada pra
+// escala; se o volume crescer bastante, precisa de paginação de verdade.
+app.get('/api/admin/reconciliacao-assinaturas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const dias = Math.max(1, Number(req.query.dias) || 90);
+  try {
+    const desde = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const [{ data: recebidos }, { data: confirmados }] = await Promise.all([
+      asaas.get(`/payments?status=RECEIVED&dateCreated[ge]=${desde}&limit=100`),
+      asaas.get(`/payments?status=CONFIRMED&dateCreated[ge]=${desde}&limit=100`),
+    ]);
+    const pagamentosPorId = new Map();
+    for (const p of [...(recebidos?.data || []), ...(confirmados?.data || [])]) pagamentosPorId.set(p.id, p);
+    const pagamentos = [...pagamentosPorId.values()];
+
+    const customerIds = [...new Set(pagamentos.map(p => p.customer).filter(Boolean))];
+    if (!customerIds.length) return res.json({ periodo_dias: dias, pagamentos_verificados: 0, problemas: [] });
+
+    // Sequencial de propósito (não Promise.all) — evita estourar rate limit
+    // da Asaas se o volume crescer; é auditoria manual, não caminho quente.
+    const clientes = [];
+    for (const id of customerIds) {
+      try {
+        const { data } = await asaas.get(`/customers/${id}`);
+        clientes.push({ id, email: data?.email || null, name: data?.name || null });
+      } catch (e) {
+        clientes.push({ id, email: null, name: null, erro: true });
+      }
+    }
+
+    const emails = clientes.map(c => c.email).filter(Boolean);
+    const { data: assinaturasEncontradas } = emails.length
+      ? await supabase.from('assinaturas').select('titular_email,status,asaas_customer_id').in('titular_email', emails)
+      : { data: [] };
+    const assinaturaPorEmail = Object.fromEntries((assinaturasEncontradas || []).map(a => [a.titular_email, a]));
+
+    const problemas = [];
+    for (const cliente of clientes) {
+      if (!cliente.email) {
+        problemas.push({ tipo: 'cliente_sem_email', asaasCustomerId: cliente.id });
+        continue;
+      }
+      const assinatura = assinaturaPorEmail[cliente.email];
+      const pagamentosDoCliente = pagamentos.filter(p => p.customer === cliente.id)
+        .map(p => ({ id: p.id, value: p.value, status: p.status, paymentDate: p.paymentDate || p.clientPaymentDate || null }));
+      if (!assinatura) {
+        problemas.push({ tipo: 'assinatura_ausente', email: cliente.email, nome: cliente.name, asaasCustomerId: cliente.id, pagamentos: pagamentosDoCliente });
+      } else if (assinatura.asaas_customer_id !== cliente.id) {
+        problemas.push({ tipo: 'customer_id_divergente', email: cliente.email, nome: cliente.name, asaasCustomerId: cliente.id, supabaseCustomerId: assinatura.asaas_customer_id, supabaseStatus: assinatura.status, pagamentos: pagamentosDoCliente });
+      } else if (!['ativa', 'trial', 'vencida', 'cancelada'].includes(assinatura.status)) {
+        problemas.push({ tipo: 'status_desconhecido', email: cliente.email, nome: cliente.name, supabaseStatus: assinatura.status, pagamentos: pagamentosDoCliente });
+      }
+    }
+
+    res.json({ periodo_dias: dias, pagamentos_verificados: pagamentos.length, clientes_verificados: customerIds.length, problemas });
+  } catch (e) {
+    console.error('[admin/reconciliacao-assinaturas] erro:', e.response?.data || e.message || e);
+    res.status(500).json({ error: 'Erro ao reconciliar com a Asaas' });
+  }
+});
+
 app.get('/api/admin/professional-payments', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { email } = req.query;
