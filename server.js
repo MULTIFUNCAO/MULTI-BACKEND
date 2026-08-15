@@ -1231,8 +1231,18 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
 // copia-e-cola). A ativação de verdade em "assinaturas" só acontece em
 // /api/assinatura/confirmar-pix, chamado pelo front depois que o polling em
 // /api/status-pagamento/:id indicar que o pagamento foi recebido.
+//
+// Exceção: cupom de mês grátis (2026-08-15). Antes disso o front travava o
+// método em "cartao" sempre que tinha cupom aplicado, excluindo quem só usa
+// Pix — justamente quem mais precisa poder testar antes de se comprometer.
+// Com cupom válido não existe nada pra cobrar no ciclo 1, então nem chega a
+// gerar QR Code: ativa a assinatura direto como cortesia (mesmo shape que
+// ativarAssinatura() já grava pra cartão+cupom em /cobrar, só que sem
+// subscriptionId — Pix nunca teve cobrança recorrente automática na Asaas
+// aqui, com ou sem cupom, então o 2º mês cai no mesmo padrão manual que já
+// vale pra qualquer assinante Pix hoje).
 app.post("/api/assinatura/gerar-pix", async (req, res) => {
-  const { titularTipo, titularEmail, titularNome, plano, cpf, phone } = req.body || {};
+  const { titularTipo, titularEmail, titularNome, plano, cpf, phone, cupom } = req.body || {};
 
   if (titularTipo !== "usuario")
     return res.status(400).json({ error: "titularTipo inválido" });
@@ -1241,8 +1251,42 @@ app.post("/api/assinatura/gerar-pix", async (req, res) => {
   if (!titularEmail || !cpf)
     return res.status(400).json({ error: "Dados incompletos" });
 
+  // Mesma regra de /cobrar: cupom só vale pro Multi Autônomo, nunca confia
+  // que o front já escondeu o campo pros outros planos.
+  if (cupom && plano !== "autonomo")
+    return res.status(400).json({ error: "Cupom vale apenas para o Multi Autônomo" });
+
   try {
+    // Revalida do zero (nunca confia no /validar-cupom anterior) — mesmo
+    // padrão de /cobrar.
+    let cupomValidado = null;
+    if (cupom) {
+      const resultado = await buscarCupomValido(cupom, titularEmail);
+      if (!resultado.ok) return res.status(400).json({ error: "cupom_invalido", motivo: resultado.motivo });
+      cupomValidado = resultado.cupom;
+    }
+
     const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
+
+    if (cupomValidado) {
+      const { proximaCobranca } = await ativarAssinatura({
+        titularTipo, titularEmail, plano, paymentId: null, customerId,
+        subscriptionId: null,
+        cupomCodigo: cupomValidado.codigo,
+        cortesia: true,
+      });
+      await registrarUsoCupom(cupomValidado, titularEmail);
+
+      log("ASSINATURA PIX ATIVADA (CORTESIA CUPOM)", { titularEmail, plano, cupom: cupomValidado.codigo });
+      return res.json({
+        success: true,
+        cortesia: true,
+        status: "ativa",
+        customerId,
+        valor: planoInfo.valor,
+        proximaCobranca: proximaCobranca.toISOString(),
+      });
+    }
 
     const pay = await asaas.post("/payments", {
       customer: customerId, billingType: "PIX", value: planoInfo.valor,
