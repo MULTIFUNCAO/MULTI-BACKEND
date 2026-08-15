@@ -572,24 +572,6 @@ app.post('/api/documentos/analisar-ia', async (req, res) => {
   if (!email) return res.status(400).json({ error: 'email é obrigatório' });
   const key = (process.env.ANTHROPIC_KEY_V2 || process.env.ANTHROPIC_KEY);
   if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
-  // DEBUG TEMPORÁRIO (2026-08-15) — nunca expõe a chave inteira, só formato/
-  // tamanho, pra confirmar se o processo do Render está lendo o valor certo.
-  if (req.query.debugKey === '1') {
-    const v2 = process.env.ANTHROPIC_KEY_V2;
-    const v1 = process.env.ANTHROPIC_KEY;
-    return res.json({
-      keyLength: key.length,
-      keyPrefix: key.slice(0, 8),
-      keySuffix: key.slice(-4),
-      hasWhitespace: key !== key.trim(),
-      v2Set: v2 !== undefined,
-      v2Length: v2 ? v2.length : null,
-      v1Set: v1 !== undefined,
-      v1Length: v1 ? v1.length : null,
-      deployMarker: '4c6df9f-check',
-    });
-  }
-
   // Busca as URLs (frente/verso) aqui no backend, pelo client de
   // service_role — o frontend só manda o email. Evita uma segunda consulta
   // ao Supabase no navegador logo depois do upload, que travou sem erro
@@ -654,10 +636,7 @@ Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ile
     res.json({ success: true, status, observacoes });
   } catch (e) {
     console.error('[analisar-ia] Erro:', e.message);
-    // DEBUG TEMPORÁRIO (2026-08-15) — expõe o erro real da Anthropic pra
-    // diagnosticar por que analise_ia_status nunca grava. Reverter assim que
-    // confirmado.
-    res.status(200).json({ success: false, error: 'IA indisponível no momento', debug: e.response?.data || e.message });
+    res.status(200).json({ success: false, error: 'IA indisponível no momento' });
   }
 });
 
