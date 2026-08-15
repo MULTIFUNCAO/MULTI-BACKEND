@@ -575,11 +575,18 @@ app.post('/api/documentos/analisar-ia', async (req, res) => {
   // DEBUG TEMPORÁRIO (2026-08-15) — nunca expõe a chave inteira, só formato/
   // tamanho, pra confirmar se o processo do Render está lendo o valor certo.
   if (req.query.debugKey === '1') {
+    const v2 = process.env.ANTHROPIC_KEY_V2;
+    const v1 = process.env.ANTHROPIC_KEY;
     return res.json({
       keyLength: key.length,
       keyPrefix: key.slice(0, 8),
       keySuffix: key.slice(-4),
       hasWhitespace: key !== key.trim(),
+      v2Set: v2 !== undefined,
+      v2Length: v2 ? v2.length : null,
+      v1Set: v1 !== undefined,
+      v1Length: v1 ? v1.length : null,
+      deployMarker: '4c6df9f-check',
     });
   }
 
