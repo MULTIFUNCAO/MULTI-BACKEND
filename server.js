@@ -910,7 +910,7 @@ app.post("/api/webhook-asaas", async (req, res) => {
   // 2026-08-13: cobrança de renovação que falhou/venceu — antes disso não
   // existia NENHUM handler pra esse evento, então uma assinatura cujo cartão
   // falhasse na renovação ficava "ativa" pra sempre (com proxima_cobranca no
-  // passado, mas nada sinalizando isso em lugar nenhum). Marca "vencida"
+  // passado, mas nada sinalizando isso em lugar nenhum). Marca "inadimplente"
   // (revoga isPro no front — ver App.jsx carregarPlano — e bloqueia limites
   // de plano no backend, que só aceitam status "ativa"/"trial"). Mesmo
   // lookup por asaas_subscription_id do bloco de renovação acima, mesmo
@@ -918,15 +918,21 @@ app.post("/api/webhook-asaas", async (req, res) => {
   // automática: se a Asaas cobrar de novo com sucesso depois, o bloco de
   // PAYMENT_RECEIVED/CONFIRMED acima já sobrescreve status pra "ativa" de
   // novo, sem precisar de lógica extra aqui.
+  // 2026-08-15, achado real: esse handler gravava "vencida" desde que foi
+  // criado — não é um valor válido de assinaturas_status_check (só
+  // 'trial','pendente','ativa','inadimplente','cancelada','expirada'), então
+  // TODO UPDATE aqui falhava com erro 23514, sempre, silenciosamente
+  // (capturado pelo catch abaixo, só logado). Nenhuma cobrança atrasada
+  // nunca foi marcada de verdade. Trocado pro valor real da constraint.
   if (event === "PAYMENT_OVERDUE" && payment?.subscription) {
     try {
       const { data: assinatura } = await supabase
         .from("assinaturas").select("titular_tipo,titular_email")
         .eq("asaas_subscription_id", payment.subscription).maybeSingle();
       if (assinatura) {
-        await supabase.from("assinaturas").update({ status: "vencida" })
+        await supabase.from("assinaturas").update({ status: "inadimplente" })
           .eq("titular_tipo", assinatura.titular_tipo).eq("titular_email", assinatura.titular_email);
-        console.log("[WEBHOOK] Assinatura marcada vencida:", payment.subscription, assinatura.titular_email);
+        console.log("[WEBHOOK] Assinatura marcada inadimplente:", payment.subscription, assinatura.titular_email);
       } else {
         console.warn("[WEBHOOK] PAYMENT_OVERDUE de uma assinatura sem registro em 'assinaturas':", payment.subscription);
       }
@@ -1730,10 +1736,12 @@ app.get('/api/admin/professionals', async (req, res) => {
         ? (suasAvaliacoes.reduce((s, a) => s + (a.estrelas || 0), 0) / suasAvaliacoes.length)
         : null;
 
-      // paymentStatus: "vencida" é setado de verdade pelo webhook (PAYMENT_OVERDUE,
-      // ver /api/webhook-asaas) a partir de agora. O fallback por data cobre
-      // assinaturas que já estavam vencidas ANTES desse handler existir (nunca
-      // vão receber o webhook de novo pra corrigir status sozinhas).
+      // paymentStatus: "inadimplente" é setado de verdade pelo webhook
+      // (PAYMENT_OVERDUE, ver /api/webhook-asaas) a partir de agora (valor real
+      // da constraint — "vencida", usado até 2026-08-15, nunca foi válido, ver
+      // nota no handler do webhook). O fallback por data cobre assinaturas que
+      // já estavam vencidas ANTES desse handler existir (nunca vão receber o
+      // webhook de novo pra corrigir status sozinhas).
       //
       // 2026-08-13, achado real (Teste Categoria QA, thyago_santos86 etc.
       // aparecendo "Pago em dia" sem nunca terem pago nada): status='ativa'
@@ -1752,7 +1760,7 @@ app.get('/api/admin/professionals', async (req, res) => {
         const proximaCobranca = assinatura.proxima_cobranca ? new Date(assinatura.proxima_cobranca).getTime() : null;
         const temVinculoReal = !!assinatura.asaas_customer_id || !!assinatura.cortesia;
         if (assinatura.status === 'cancelada') paymentStatus = 'cancelado';
-        else if (assinatura.status === 'vencida') paymentStatus = 'vencido';
+        else if (assinatura.status === 'inadimplente') paymentStatus = 'vencido';
         else if (assinatura.status === 'ativa' || assinatura.status === 'trial') {
           if (!temVinculoReal) paymentStatus = 'sem_confirmacao';
           else paymentStatus = (proximaCobranca && proximaCobranca < Date.now()) ? 'vencido' : 'pago';
@@ -1913,7 +1921,7 @@ app.get('/api/admin/reconciliacao-assinaturas', async (req, res) => {
         problemas.push({ tipo: 'assinatura_ausente', email: cliente.email, nome: cliente.name, asaasCustomerId: cliente.id, pagamentos: pagamentosDoCliente });
       } else if (assinatura.asaas_customer_id !== cliente.id) {
         problemas.push({ tipo: 'customer_id_divergente', email: cliente.email, nome: cliente.name, asaasCustomerId: cliente.id, supabaseCustomerId: assinatura.asaas_customer_id, supabaseStatus: assinatura.status, pagamentos: pagamentosDoCliente });
-      } else if (!['ativa', 'trial', 'vencida', 'cancelada'].includes(assinatura.status)) {
+      } else if (!['ativa', 'trial', 'pendente', 'inadimplente', 'cancelada', 'expirada'].includes(assinatura.status)) {
         problemas.push({ tipo: 'status_desconhecido', email: cliente.email, nome: cliente.name, supabaseStatus: assinatura.status, pagamentos: pagamentosDoCliente });
       }
     }
