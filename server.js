@@ -233,7 +233,11 @@ app.post("/api/email/campanha", async (req, res) => {
 
   let lista = [];
   if (destinatarios === "todos") {
-    const { data } = await supabase.from("users").select("name, email").not("email", "is", null);
+    // "users" é tabela morta (0 linhas, mesma raiz do bug já mapeado em
+    // multi_admin_dashboard_endpoint_mismatch/multi_login_hang_critico na
+    // memória) — campanha "todos" sempre voltava lista vazia. Fonte real é
+    // "usuarios".
+    const { data } = await supabase.from("usuarios").select("name, email").not("email", "is", null);
     lista = data || [];
   } else if (Array.isArray(destinatarios)) {
     lista = destinatarios.filter(d => d.email);
