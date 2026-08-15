@@ -526,7 +526,7 @@ app.post('/api/sugestao-meta', async (req, res) => {
   try {
     const r = await axios.post(
       'https://api.anthropic.com/v1/messages',
-      { model: 'claude-sonnet-4-6', max_tokens: 512, messages: [{ role: 'user', content: prompt }] },
+      { model: 'claude-sonnet-5', max_tokens: 512, messages: [{ role: 'user', content: prompt }] },
       { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 20000 }
     );
     const txt = r.data?.content?.[0]?.text || '{}';
@@ -611,7 +611,7 @@ Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ile
     const r = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-5',
         max_tokens: 500,
         messages: [{
           role: 'user',
