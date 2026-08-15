@@ -637,7 +637,10 @@ Use "ok" só quando o documento estiver claramente legível e íntegro. Use "ile
     res.json({ success: true, status, observacoes });
   } catch (e) {
     console.error('[analisar-ia] Erro:', e.message);
-    res.status(200).json({ success: false, error: 'IA indisponível no momento' });
+    // DEBUG TEMPORÁRIO (2026-08-15) — expõe o erro real da Anthropic pra
+    // diagnosticar por que analise_ia_status nunca grava. Reverter assim que
+    // confirmado.
+    res.status(200).json({ success: false, error: 'IA indisponível no momento', debug: e.response?.data || e.message });
   }
 });
 
