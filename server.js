@@ -572,6 +572,16 @@ app.post('/api/documentos/analisar-ia', async (req, res) => {
   if (!email) return res.status(400).json({ error: 'email é obrigatório' });
   const key = process.env.ANTHROPIC_KEY;
   if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
+  // DEBUG TEMPORÁRIO (2026-08-15) — nunca expõe a chave inteira, só formato/
+  // tamanho, pra confirmar se o processo do Render está lendo o valor certo.
+  if (req.query.debugKey === '1') {
+    return res.json({
+      keyLength: key.length,
+      keyPrefix: key.slice(0, 8),
+      keySuffix: key.slice(-4),
+      hasWhitespace: key !== key.trim(),
+    });
+  }
 
   // Busca as URLs (frente/verso) aqui no backend, pelo client de
   // service_role — o frontend só manda o email. Evita uma segunda consulta
