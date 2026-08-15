@@ -514,7 +514,7 @@ app.post('/api/sugestao-meta', async (req, res) => {
   if (!Array.isArray(servicos) || servicos.length === 0 || !(meta > 0)) {
     return res.status(400).json({ erro: 'Parâmetros inválidos' });
   }
-  const key = process.env.ANTHROPIC_KEY;
+  const key = (process.env.ANTHROPIC_KEY_V2 || process.env.ANTHROPIC_KEY);
   if (!key) return res.status(500).json({ erro: 'ANTHROPIC_KEY não configurada no servidor' });
 
   const lista = servicos.map(s =>
@@ -543,7 +543,7 @@ app.post('/api/sugestao-meta', async (req, res) => {
 app.post('/api/ia-chat', async (req, res) => {
   const { system, message } = req.body || {};
   if (!message) return res.status(400).json({ erro: 'message obrigatório' });
-  const key = process.env.ANTHROPIC_KEY;
+  const key = (process.env.ANTHROPIC_KEY_V2 || process.env.ANTHROPIC_KEY);
   if (!key) return res.status(500).json({ erro: 'ANTHROPIC_KEY não configurada' });
   try {
     const r = await axios.post(
@@ -570,7 +570,7 @@ app.post('/api/ia-chat', async (req, res) => {
 app.post('/api/documentos/analisar-ia', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'email é obrigatório' });
-  const key = process.env.ANTHROPIC_KEY;
+  const key = (process.env.ANTHROPIC_KEY_V2 || process.env.ANTHROPIC_KEY);
   if (!key) return res.status(200).json({ success: false, error: 'ANTHROPIC_KEY não configurada no servidor' });
   // DEBUG TEMPORÁRIO (2026-08-15) — nunca expõe a chave inteira, só formato/
   // tamanho, pra confirmar se o processo do Render está lendo o valor certo.
