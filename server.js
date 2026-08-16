@@ -920,20 +920,16 @@ app.post("/api/webhook-asaas", async (req, res) => {
     }
   }
 
-  // Lógica antiga abaixo — grava em tabelas mortas ("users"/"pedidos.payment_id"),
-  // nunca teve efeito real (ver nota histórica no topo deste handler), mantida
-  // só pra não quebrar nada que ainda dependa do 200 de resposta.
-  if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") {
-    const paymentId = payment?.id;
-    if (paymentId) {
-      await supabase.from("users").update({ is_pro: true }).eq("payment_id", paymentId);
-      const { data: pedidos } = await supabase.from("pedidos").select("id").eq("payment_id", paymentId);
-      if (pedidos && pedidos.length > 0) {
-        await supabase.from("pedidos").update({ status: "pago", phase: 2 }).eq("payment_id", paymentId);
-        console.log("[WEBHOOK] Pedido pago:", paymentId);
-      }
-    }
-  }
+  // 2026-08-16: removida a lógica antiga que gravava em "users"
+  // (tabela morta) e "pedidos.payment_id"/"phase" (colunas que não existem
+  // no schema real) — nunca teve efeito real (ver nota histórica no topo
+  // deste handler) e, diferente dos dois blocos acima, rodava SEM
+  // try/catch em todo evento de pagamento. Investigando a fila da Asaas
+  // pausada após 15 falhas em sequência (nenhuma delas deixou rastro nos
+  // logs da aplicação, nem nos catch acima — consistente com timeout de
+  // cold-start do plano Free do Render, não com uma exceção daqui; ver
+  // memória multi_webhook_asaas_fila_pausada), mas um bloco sem try/catch
+  // no meio do handler era risco real e desnecessário de qualquer forma.
   res.sendStatus(200);
 });
 
