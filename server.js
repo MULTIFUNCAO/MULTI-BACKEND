@@ -2177,6 +2177,38 @@ app.get('/api/admin/professional-payments', async (req, res) => {
   }
 });
 
+// Crédito manual de moeda — não existia nenhum jeito de repor saldo sem um
+// pagamento PIX real de novo (achado ao testar o motor de precificação/gasto
+// de moeda ao vivo em produção: gastar 2 moedas de teste deixou a conta de
+// review zerada, sem trilha oficial pra repor). Mesma RPC creditar_moedas já
+// usada por /api/moedas/confirmar-pix e pelo webhook, só que aqui quem
+// autoriza é o admin (x-admin-key), não a Asaas confirmando um pagamento —
+// por isso tipo:'credito_admin' em vez de 'compra' (coluna já previa esse
+// tipo desde a Fase 1, só nunca tinha endpoint que usasse).
+app.post('/api/admin/moedas/creditar-manual', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email, quantidade, descricao } = req.body || {};
+  const qtd = Number(quantidade);
+  if (!email || !Number.isInteger(qtd) || qtd <= 0)
+    return res.status(400).json({ error: 'email e quantidade (inteiro positivo) são obrigatórios' });
+
+  try {
+    const { data: saldo, error } = await supabase.rpc('creditar_moedas', {
+      p_email: email,
+      p_quantidade: qtd,
+      p_tipo: 'credito_admin',
+      p_descricao: descricao || 'Crédito manual via admin',
+    });
+    if (error) throw error;
+
+    log('MOEDAS CRÉDITO ADMIN', { email, quantidade: qtd, saldo });
+    res.json({ success: true, saldo });
+  } catch (e) {
+    log('ERRO admin/moedas/creditar-manual', e.message || e);
+    res.status(500).json({ error: e.message || 'Erro ao creditar moeda' });
+  }
+});
+
 app.post('/api/admin/approve-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
