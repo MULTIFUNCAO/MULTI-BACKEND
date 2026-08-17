@@ -1582,6 +1582,47 @@ app.post("/api/moedas/confirmar-pix", async (req, res) => {
   }
 });
 
+// Gasto de moeda ao responder uma oportunidade (Fase 2 do motor de
+// precificação/monetização por moeda) — profissional sem plano pago ativo
+// paga custo_moedas do pedido em vez de assinar. Único ponto que chama a RPC
+// debitar_moedas (ver supabase_moedas_debito_oportunidade_migration.sql):
+// ela mesma lê pedidos.custo_moedas, nunca confia em nada que o client
+// mande aqui além do pedidoId — não dá pra manipular quanto vai ser cobrado.
+// Idempotente do lado do Postgres (mesmo profissional + mesmo pedido não
+// debita duas vezes); esse endpoint só repassa o resultado.
+app.post("/api/moedas/responder-oportunidade", async (req, res) => {
+  const { email, pedidoId } = req.body || {};
+  if (!email || !pedidoId)
+    return res.status(400).json({ error: "dados_incompletos" });
+
+  try {
+    const { data: saldo, error } = await supabase.rpc("debitar_moedas", {
+      p_email: email,
+      p_pedido_id: pedidoId,
+    });
+    if (error) throw error;
+
+    log("MOEDAS DEBITADAS", { email, pedidoId, saldo });
+    res.json({ success: true, saldo });
+  } catch (e) {
+    const msg = e.message || "";
+    if (msg.includes("saldo_insuficiente")) {
+      // Busca o saldo atual pra o front mostrar quanto falta, já que a RPC
+      // não retorna nada quando dá exception.
+      const { data: usuario } = await supabase.from("usuarios").select("saldo_moedas").eq("email", email).maybeSingle();
+      return res.status(402).json({ error: "saldo_insuficiente", saldo: usuario?.saldo_moedas || 0 });
+    }
+    if (msg.includes("pedido_sem_custo")) {
+      return res.status(400).json({ error: "pedido_sem_custo" });
+    }
+    if (msg.includes("usuario_nao_encontrado")) {
+      return res.status(404).json({ error: "usuario_nao_encontrado" });
+    }
+    log("ERRO moedas/responder-oportunidade", e.response?.data || msg || e);
+    res.status(500).json({ error: msg || "Erro ao debitar moeda" });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // ADMIN — Documentação do profissional (protegido por x-admin-key, mesmo
 // padrão de /api/admin/usuarios). Único jeito de um documento virar
