@@ -930,6 +930,37 @@ app.post("/api/webhook-asaas", async (req, res) => {
   // cold-start do plano Free do Render, não com uma exceção daqui; ver
   // memória multi_webhook_asaas_fila_pausada), mas um bloco sem try/catch
   // no meio do handler era risco real e desnecessário de qualquer forma.
+
+  // Compra de moeda ("Multi Moeda") — pagamento avulso (nunca tem
+  // payment.subscription), reconhecido pelo externalReference
+  // "moedas:<email>:<pacoteId>" gravado em /api/moedas/gerar-pix. Fallback
+  // pro caso do client fechar o app antes do polling de
+  // /api/moedas/confirmar-pix detectar o pagamento — creditar_moedas() é
+  // idempotente por paymentId, então não importa qual dos dois chega
+  // primeiro, nunca credita em dobro.
+  if ((event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") && typeof payment?.externalReference === "string" && payment.externalReference.startsWith("moedas:")) {
+    try {
+      const [, email, pacoteId] = payment.externalReference.split(":");
+      const pacotes = await getPacotesMoedas();
+      const pacote = pacotes.find(p => String(p.id) === String(pacoteId));
+      if (!pacote) {
+        console.warn("[WEBHOOK] Compra de moeda com pacoteId desconhecido:", payment.externalReference);
+      } else {
+        const { data: saldo, error } = await supabase.rpc("creditar_moedas", {
+          p_email: email,
+          p_quantidade: pacote.quantidade,
+          p_payment_id: payment.id,
+          p_tipo: "compra",
+          p_descricao: `Compra: ${pacote.nome}`,
+        });
+        if (error) throw error;
+        console.log("[WEBHOOK] Moedas creditadas:", email, pacote.quantidade, "saldo:", saldo);
+      }
+    } catch (e) {
+      console.error("[WEBHOOK] Erro ao processar compra de moeda:", e.message || e);
+    }
+  }
+
   res.sendStatus(200);
 });
 
@@ -1430,6 +1461,124 @@ app.post("/api/pedidos/confirmar-servico", async (req, res) => {
   } catch (e) {
     log("ERRO pedidos/confirmar-servico", e.message || e);
     res.status(500).json({ error: e.message || "Erro ao confirmar serviço" });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// MOEDAS ("Multi Moeda") — Fase 1 da monetização por moeda: carteira + compra.
+// Ainda não gasta moeda em lugar nenhum (isso é Fase 3, o gate de aceite em
+// /api/pedidos/confirmar-servico acima) — só permite comprar e consultar
+// saldo. saldo_moedas só pode mudar via creditar_moedas() no Postgres (ver
+// supabase_moedas_carteira_migration.sql — RPC security definer, EXECUTE
+// restrito a service_role, e um trigger que reverte qualquer UPDATE direto
+// de saldo_moedas que não venha do service_role).
+// ════════════════════════════════════════════════════════════════════════════
+const PACOTES_MOEDAS_FALLBACK = [
+  { id: "10",  nome: "10 moedas",  quantidade: 10,  preco_centavos: 2500,  ativo: true, ordem: 1 },
+  { id: "25",  nome: "25 moedas",  quantidade: 25,  preco_centavos: 5990,  ativo: true, ordem: 2 },
+  { id: "50",  nome: "50 moedas",  quantidade: 50,  preco_centavos: 10990, ativo: true, ordem: 3 },
+  { id: "100", nome: "100 moedas", quantidade: 100, preco_centavos: 19990, ativo: true, ordem: 4 },
+];
+// Mesmo padrão de cache de getPlanoLimites() acima — lê "moedas_pacotes" do
+// Supabase (fonte única, admin-editável sem precisar mexer em código) com
+// cache de 60s, e cai pro fallback hardcoded se a leitura falhar.
+let _pacotesMoedasCache = null;
+let _pacotesMoedasCacheEm = 0;
+async function getPacotesMoedas() {
+  const agora = Date.now();
+  if (_pacotesMoedasCache && (agora - _pacotesMoedasCacheEm) < PLANO_LIMITES_CACHE_TTL_MS) {
+    return _pacotesMoedasCache;
+  }
+  try {
+    const { data, error } = await supabase.from("moedas_pacotes").select("*").eq("ativo", true).order("ordem");
+    if (error || !data?.length) throw error || new Error("moedas_pacotes vazia");
+    _pacotesMoedasCache = data;
+    _pacotesMoedasCacheEm = agora;
+    return data;
+  } catch (e) {
+    log("AVISO: falha ao ler moedas_pacotes, usando fallback hardcoded", e.message || e);
+    return PACOTES_MOEDAS_FALLBACK;
+  }
+}
+
+// Gera a cobrança Pix do pacote de moeda — mesmo template de
+// /api/assinatura/gerar-pix (buscarOuCriarClienteAsaas reaproveitado dali).
+// externalReference "moedas:<email>:<pacoteId>" é o que o webhook usa pra
+// reconhecer esse pagamento como compra de moeda (ver /api/webhook-asaas).
+app.post("/api/moedas/gerar-pix", async (req, res) => {
+  const { email, nome, cpf, phone, pacoteId } = req.body || {};
+  if (!email || !cpf || !pacoteId)
+    return res.status(400).json({ error: "dados_incompletos" });
+
+  try {
+    const pacotes = await getPacotesMoedas();
+    const pacote = pacotes.find(p => String(p.id) === String(pacoteId));
+    if (!pacote) return res.status(400).json({ error: "pacote_invalido" });
+
+    const customerId = await buscarOuCriarClienteAsaas({ email, nome, cpf, phone });
+    const valor = pacote.preco_centavos / 100;
+
+    const pay = await asaas.post("/payments", {
+      customer: customerId, billingType: "PIX", value: valor,
+      dueDate: new Date().toISOString().split("T")[0],
+      description: `${pacote.nome} — Multi Moeda (PIX)`,
+      externalReference: `moedas:${email}:${pacote.id}`,
+    });
+
+    const qr = await asaas.get(`/payments/${pay.data.id}/pixQrCode`);
+
+    log("MOEDAS PIX GERADO", { email, pacoteId: pacote.id, paymentId: pay.data.id });
+    res.json({
+      paymentId: pay.data.id,
+      customerId,
+      pixCode: qr.data.payload,
+      qrCodeBase64: qr.data.encodedImage,
+      expiresAt: qr.data.expirationDate,
+      value: valor,
+      quantidade: pacote.quantidade,
+    });
+  } catch (e) {
+    log("ERRO moedas/gerar-pix", e.response?.data || e.message || e);
+    res.status(500).json({
+      error: e.response?.data?.errors?.[0]?.description || e.response?.data?.message || e.message || "Erro ao gerar PIX",
+      detail: e.response?.data || { message: e.message },
+    });
+  }
+});
+
+// Reconfere o pagamento direto na Asaas (nunca confia no client) e credita
+// via a RPC creditar_moedas — idempotente: se esse paymentId já creditou
+// antes (retry do polling, ou o webhook chegou primeiro), só devolve o saldo
+// atual sem duplicar. Mesmo template de /api/assinatura/confirmar-pix.
+app.post("/api/moedas/confirmar-pix", async (req, res) => {
+  const { paymentId, email, pacoteId } = req.body || {};
+  if (!paymentId || !email || !pacoteId)
+    return res.status(400).json({ error: "dados_incompletos" });
+
+  try {
+    const pacotes = await getPacotesMoedas();
+    const pacote = pacotes.find(p => String(p.id) === String(pacoteId));
+    if (!pacote) return res.status(400).json({ error: "pacote_invalido" });
+
+    const { data: pay } = await asaas.get(`/payments/${paymentId}`);
+    if (!["CONFIRMED", "RECEIVED"].includes(pay.status)) {
+      return res.status(402).json({ error: "pagamento_nao_confirmado", status: pay.status });
+    }
+
+    const { data: saldo, error } = await supabase.rpc("creditar_moedas", {
+      p_email: email,
+      p_quantidade: pacote.quantidade,
+      p_payment_id: paymentId,
+      p_tipo: "compra",
+      p_descricao: `Compra: ${pacote.nome}`,
+    });
+    if (error) throw error;
+
+    log("MOEDAS CREDITADAS", { email, pacoteId: pacote.id, paymentId, saldo });
+    res.json({ success: true, saldo, quantidade: pacote.quantidade, paymentId });
+  } catch (e) {
+    log("ERRO moedas/confirmar-pix", e.response?.data || e.message || e);
+    res.status(500).json({ error: e.response?.data?.message || e.message || "Erro ao confirmar pagamento" });
   }
 });
 
