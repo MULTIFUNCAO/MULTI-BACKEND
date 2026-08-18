@@ -1519,6 +1519,20 @@ app.post("/api/moedas/gerar-pix", async (req, res) => {
     return res.status(400).json({ error: "dados_incompletos" });
 
   try {
+    // Moeda só serve pra profissional sem plano pagar por resposta a
+    // oportunidade — não tem nenhum uso pra quem é só cliente. Achado
+    // 2026-08-18: o front tinha um buraco (tela "Escolher plano" acessível
+    // direto do Profile de cliente comum, sem checar role nenhum) que deixou
+    // um cliente comprar moeda de verdade via PIX, sem nunca ter como usar.
+    // Bloqueio aqui é o que realmente impede a cobrança de acontecer — o
+    // gate no front (permiteComprarMoedas) evita mostrar a opção, mas
+    // qualquer um batendo direto nesse endpoint pulava ele.
+    const { data: usuario, error: usuarioErr } = await supabase
+      .from("usuarios").select("role").eq("email", email).maybeSingle();
+    if (usuarioErr) throw usuarioErr;
+    if (!usuario || usuario.role !== "professional")
+      return res.status(403).json({ error: "somente_profissional" });
+
     const pacotes = await getPacotesMoedas();
     const pacote = pacotes.find(p => String(p.id) === String(pacoteId));
     if (!pacote) return res.status(400).json({ error: "pacote_invalido" });
