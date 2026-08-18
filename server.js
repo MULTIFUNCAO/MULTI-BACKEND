@@ -744,14 +744,19 @@ app.post("/api/auth/redefinir-senha", async (req, res) => {
   }
 });
 
-// Reset senha com codigo 6 digitos via SendGrid
-const resetCodes = {};
-
+// Reset senha com codigo 6 digitos via SendGrid — código guardado na tabela
+// password_reset_codes (ver supabase_password_reset_codes_migration.sql),
+// não mais em memória do processo. Achado 2026-08-18 investigando o caso do
+// Jhonatan: o objeto `resetCodes = {}` em memória se perdia em qualquer
+// restart do backend (deploy, crash, sleep do Render) — código pendente
+// virava inválido sem nenhum aviso pro usuário, mesmo digitando certo.
 app.post("/api/auth/solicitar-codigo", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Email obrigatorio" });
   const code = Math.floor(100000 + Math.random() * 900000).toString();
-  resetCodes[email] = { code, expires: Date.now() + 15 * 60 * 1000 };
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  const { error: dbError } = await supabase.from("password_reset_codes").upsert({ email, code, expires_at: expiresAt });
+  if (dbError) return res.status(500).json({ error: "Erro ao gerar codigo" });
   try {
     await sgMail.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
     res.json({ ok: true });
@@ -760,9 +765,12 @@ app.post("/api/auth/solicitar-codigo", async (req, res) => {
 
 app.post("/api/auth/verificar-codigo", async (req, res) => {
   const { email, code, newPassword } = req.body;
-  const entry = resetCodes[email];
+  const { data: entry } = await supabase.from("password_reset_codes").select("code, expires_at").eq("email", email).maybeSingle();
   if (!entry) return res.status(400).json({ error: "Nenhum codigo solicitado" });
-  if (Date.now() > entry.expires) { delete resetCodes[email]; return res.status(400).json({ error: "Codigo expirado" }); }
+  if (Date.now() > new Date(entry.expires_at).getTime()) {
+    await supabase.from("password_reset_codes").delete().eq("email", email);
+    return res.status(400).json({ error: "Codigo expirado" });
+  }
   if (entry.code !== code) return res.status(400).json({ error: "Codigo incorreto" });
   try {
     const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
@@ -770,7 +778,7 @@ app.post("/api/auth/verificar-codigo", async (req, res) => {
       if (!authUser) return res.status(404).json({ error: "Usuario nao encontrado" });
       const { error } = await supabase.auth.admin.updateUserById(authUser.id, { password: newPassword });
     if (error) throw error;
-    delete resetCodes[email];
+    await supabase.from("password_reset_codes").delete().eq("email", email);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
