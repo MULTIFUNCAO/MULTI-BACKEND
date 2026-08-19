@@ -2071,6 +2071,106 @@ app.get('/api/admin/oportunidades', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — FUNIL DE SERVIÇOS ─────────────────────────────────────────────
+// Fase 1 do plano de CRM. Funil com os status REAIS de "pedidos" nesse
+// projeto (aberto/confirmado/em_andamento/executando/concluido/cancelado/
+// em_disputa) — a spec original descrevia um funil mais granular
+// (solicitado→aguardando profissional→proposta recebida→proposta aceita→
+// pagamento pendente→confirmado→agendado→andamento→concluído→avaliação)
+// que não bate com o que o app grava de verdade hoje; refletir o funil
+// idealizado exigiria mudar o fluxo do app inteiro, fora de escopo.
+// Tempos médios usam os marcos reais que já existem: created_at (criado),
+// aceite_formal_cliente_em/aceite_formal_profissional_em (aceite formal
+// dos dois lados — só conta quando os DOIS estão preenchidos), concluido_em.
+app.get('/api/admin/funil', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pedidos, error } = await supabase
+      .from('pedidos')
+      .select('status,created_at,aceite_formal_cliente_em,aceite_formal_profissional_em,concluido_em');
+    if (error) return res.status(500).json({ error: error.message });
+
+    const STATUS_LABELS = {
+      aberto: 'Aberto', confirmado: 'Confirmado', em_andamento: 'Em andamento',
+      executando: 'Executando', concluido: 'Concluído', cancelado: 'Cancelado', em_disputa: 'Em disputa',
+    };
+    const funilMap = {};
+    (pedidos || []).forEach(p => { funilMap[p.status] = (funilMap[p.status] || 0) + 1; });
+    const funil = Object.entries(STATUS_LABELS).map(([status, label]) => ({ status, label, count: funilMap[status] || 0 }));
+
+    const horas = (a, b) => (new Date(b).getTime() - new Date(a).getTime()) / 3600000;
+    const criadoAteAceite = [];
+    const aceiteAteConcluido = [];
+    const criadoAteConcluido = [];
+    (pedidos || []).forEach(p => {
+      const aceiteCompleto = p.aceite_formal_cliente_em && p.aceite_formal_profissional_em
+        ? (new Date(p.aceite_formal_cliente_em) > new Date(p.aceite_formal_profissional_em) ? p.aceite_formal_cliente_em : p.aceite_formal_profissional_em)
+        : null;
+      if (aceiteCompleto && p.created_at) criadoAteAceite.push(horas(p.created_at, aceiteCompleto));
+      if (aceiteCompleto && p.concluido_em) aceiteAteConcluido.push(horas(aceiteCompleto, p.concluido_em));
+      if (p.created_at && p.concluido_em) criadoAteConcluido.push(horas(p.created_at, p.concluido_em));
+    });
+    const media = (arr) => arr.length ? Math.round(arr.reduce((s, v) => s + v, 0) / arr.length) : null;
+
+    res.json({
+      funil,
+      tempos_medios_horas: {
+        criado_ate_aceite: media(criadoAteAceite),
+        aceite_ate_concluido: media(aceiteAteConcluido),
+        criado_ate_concluido: media(criadoAteConcluido),
+      },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — RELATÓRIO POR PERÍODO ─────────────────────────────────────────
+// Fase 1 do plano de CRM. ?dias=7|30|90 (ou qualquer inteiro). Compara o
+// período pedido com o período imediatamente anterior de mesmo tamanho,
+// pra dar uma noção de crescimento/queda sem precisar de mais infra.
+app.get('/api/admin/relatorio', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const dias = Math.max(1, Math.min(365, parseInt(req.query.dias, 10) || 30));
+  try {
+    const agora = new Date();
+    const inicioAtual = new Date(agora.getTime() - dias * 86400000);
+    const inicioAnterior = new Date(agora.getTime() - 2 * dias * 86400000);
+
+    const [{ data: usuarios }, { data: pedidos }] = await Promise.all([
+      supabase.from('usuarios').select('role,created_at').gte('created_at', inicioAnterior.toISOString()),
+      supabase.from('pedidos').select('status,valor,created_at,concluido_em').gte('created_at', inicioAnterior.toISOString()),
+    ]);
+
+    const emPeriodo = (iso, desde, ate) => iso && new Date(iso) >= desde && new Date(iso) < ate;
+    const contarUsuarios = (desde, ate) => {
+      const doPeriodo = (usuarios || []).filter(u => emPeriodo(u.created_at, desde, ate));
+      return {
+        clientes: doPeriodo.filter(u => u.role === 'client').length,
+        profissionais: doPeriodo.filter(u => u.role === 'professional').length,
+        empresas: doPeriodo.filter(u => u.role === 'empresa').length,
+        total: doPeriodo.length,
+      };
+    };
+    const contarPedidos = (desde, ate) => {
+      const doPeriodo = (pedidos || []).filter(p => emPeriodo(p.created_at, desde, ate));
+      const concluidos = doPeriodo.filter(p => p.status === 'concluido');
+      const cancelados = doPeriodo.filter(p => p.status === 'cancelado');
+      return {
+        solicitacoes: doPeriodo.length,
+        concluidos: concluidos.length,
+        cancelados: cancelados.length,
+        taxa_conversao: doPeriodo.length ? Math.round((concluidos.length / doPeriodo.length) * 100) : 0,
+        valor_movimentado: concluidos.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+      };
+    };
+
+    res.json({
+      periodo_dias: dias,
+      atual: { usuarios: contarUsuarios(inicioAtual, agora), pedidos: contarPedidos(inicioAtual, agora) },
+      anterior: { usuarios: contarUsuarios(inicioAnterior, inicioAtual), pedidos: contarPedidos(inicioAnterior, inicioAtual) },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — CUPONS (mês grátis pra quem divulga a plataforma) ───────────────
 // Ver supabase_cupons_migration.sql / buscarCupomValido() / registrarUsoCupom()
 // acima. Criação e ativação/desativação são as únicas mudanças de cupom que
