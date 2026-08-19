@@ -2848,6 +2848,69 @@ app.post("/api/cron/lembretes", async (req, res) => {
       }
     }
 
+    // ── Automação Fase 2 do CRM (multi_admin_crm_plano na memória):
+    // lembrete de proposta pendente. Gatilho: pedido aberto com proposta
+    // 'pendente' há mais de 3h, cliente ainda não decidiu. Ação: push pro
+    // cliente. Reaproveita esse mesmo cron/hora (já existe, roda no
+    // Render) em vez de precisar de outro Render Cron Job — mesmo padrão
+    // idempotente de coluna *_enviado_em (dispara uma vez só por pedido,
+    // não reavisa se depois chegar proposta nova pro mesmo pedido).
+    try {
+      const { data: abertos } = await supabase
+        .from("pedidos")
+        .select("id,categoria,cliente_id")
+        .eq("status", "aberto")
+        .is("lembrete_proposta_enviado_em", null);
+
+      const idsAbertos = (abertos || []).map(p => p.id);
+      const { data: propostasPendentes } = idsAbertos.length
+        ? await supabase.from("propostas").select("pedido_id,created_at").in("pedido_id", idsAbertos).eq("status", "pendente")
+        : { data: [] };
+      const maisAntigaPorPedido = {};
+      (propostasPendentes || []).forEach(pr => {
+        const atual = maisAntigaPorPedido[pr.pedido_id];
+        if (!atual || new Date(pr.created_at) < new Date(atual)) maisAntigaPorPedido[pr.pedido_id] = pr.created_at;
+      });
+
+      for (const p of (abertos || [])) {
+        const propostaEm = maisAntigaPorPedido[p.id];
+        if (!propostaEm) continue; // sem proposta nenhuma ainda — não é esse gatilho
+        const horasParada = (Date.now() - new Date(propostaEm).getTime()) / 3600000;
+        if (horasParada < 3) continue;
+        resumo.processados++;
+        try {
+          const [{ data: usuarios }, { data: empresas }] = await Promise.all([
+            supabase.from("usuarios").select("onesignal_player_id").eq("email", p.cliente_id).not("onesignal_player_id", "is", null),
+            supabase.from("empresas").select("onesignal_player_id").eq("email", p.cliente_id).not("onesignal_player_id", "is", null),
+          ]);
+          const playerIds = [...new Set([...(usuarios || []), ...(empresas || [])].map(u => u.onesignal_player_id).filter(Boolean))];
+
+          let oneSignalResp = null;
+          if (playerIds.length) {
+            const r = await fetch("https://onesignal.com/api/v1/notifications", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.ONESIGNAL_API_KEY },
+              body: JSON.stringify({
+                app_id: process.env.ONESIGNAL_APP_ID,
+                include_player_ids: playerIds,
+                headings: { pt: "Multi" },
+                contents: { pt: `💰 Você recebeu uma proposta pro seu pedido de ${p.categoria}! Responda antes que o profissional desista.` },
+              }),
+            });
+            oneSignalResp = await r.json();
+            resumo.notificados += playerIds.length;
+          }
+
+          await supabase.from("pedidos").update({ lembrete_proposta_enviado_em: new Date().toISOString() }).eq("id", p.id);
+          console.log(`[LEMBRETES] pedido ${p.id} — proposta_pendente — players: ${playerIds.length}`, oneSignalResp?.id || oneSignalResp?.errors || "");
+        } catch (e) {
+          resumo.erros.push({ pedido: p.id, erro: e.message });
+        }
+      }
+    } catch (e) {
+      resumo.erros.push({ geral: "proposta_pendente", erro: e.message });
+    }
+
     res.json(resumo);
   } catch (e) {
     res.status(500).json({ error: e.message });
