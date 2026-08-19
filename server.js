@@ -1965,6 +1965,112 @@ app.get('/api/admin/categorias', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — OPORTUNIDADES PERDIDAS / "DINHEIRO NA MESA" ──────────────────
+// Fase 1 do plano de CRM — o item de maior valor de negócio dos dois
+// documentos (doc1 item 3, doc2 quase inteiro), calculável 100% com dados
+// que já existem (pedidos/propostas/usuarios), sem precisar da infra de
+// tracking da Fase 3. Não cobre "pagamento abandonado" (não existe hoje
+// um estado de pagamento parcial por pedido pra detectar isso) — fica pra
+// quando essa informação existir.
+//
+// 3 categorias de pedido parado:
+//   sem_proposta        — status 'aberto', zero propostas
+//   proposta_sem_resposta — status 'aberto', tem proposta 'pendente', cliente ainda não escolheu
+//   parado_pos_aceite   — aceito (confirmado/em_andamento/executando) mas nunca chegou a 'concluido'
+// + clientes_reativaveis — já fecharam pelo menos 1 serviço antes, mas
+//   sem NENHUM pedido novo (de qualquer status) há mais de 30 dias.
+// Não filtra por tempo mínimo aqui (threshold é decisão de UI/negócio,
+// não do endpoint) — devolve horas_parado calculado pra cada item, o
+// front decide como agrupar/colorir.
+app.get('/api/admin/oportunidades', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pedidos, error } = await supabase
+      .from('pedidos')
+      .select('id,cliente_id,cliente_nome,categoria,valor,status,created_at');
+    if (error) return res.status(500).json({ error: error.message });
+
+    const abertoIds = (pedidos || []).filter(p => p.status === 'aberto').map(p => p.id);
+    const { data: propostasAbertos } = abertoIds.length
+      ? await supabase.from('propostas').select('pedido_id,status,created_at').in('pedido_id', abertoIds)
+      : { data: [] };
+    const propostasPorPedido = {};
+    (propostasAbertos || []).forEach(pr => (propostasPorPedido[pr.pedido_id] ||= []).push(pr));
+
+    const clienteEmails = [...new Set((pedidos || []).map(p => p.cliente_id).filter(Boolean))];
+    const { data: usuariosData } = clienteEmails.length
+      ? await supabase.from('usuarios').select('email,name,whatsapp').in('email', clienteEmails)
+      : { data: [] };
+    const usuarioPorEmail = Object.fromEntries((usuariosData || []).map(u => [u.email, u]));
+
+    const agora = Date.now();
+    const horasDesde = (iso) => iso ? Math.round((agora - new Date(iso).getTime()) / 3600000) : null;
+
+    const itens = [];
+    (pedidos || []).forEach(p => {
+      const contato = usuarioPorEmail[p.cliente_id] || {};
+      const base = {
+        pedido_id: p.id,
+        cliente_nome: p.cliente_nome || contato.name || 'Sem nome',
+        cliente_email: p.cliente_id,
+        cliente_whatsapp: contato.whatsapp || null,
+        categoria: p.categoria || 'Sem categoria',
+        valor: Number(p.valor) || 0,
+      };
+
+      if (p.status === 'aberto') {
+        const suasPropostas = propostasPorPedido[p.id] || [];
+        const pendentes = suasPropostas.filter(pr => pr.status === 'pendente');
+        if (suasPropostas.length === 0) {
+          itens.push({ ...base, tipo: 'sem_proposta', horas_parado: horasDesde(p.created_at) });
+        } else if (pendentes.length > 0) {
+          const maisAntiga = pendentes.reduce((min, pr) => (!min || new Date(pr.created_at) < new Date(min.created_at)) ? pr : min, null);
+          itens.push({ ...base, tipo: 'proposta_sem_resposta', horas_parado: horasDesde(maisAntiga?.created_at || p.created_at) });
+        }
+      } else if (['confirmado', 'em_andamento', 'executando'].includes(p.status)) {
+        itens.push({ ...base, tipo: 'parado_pos_aceite', horas_parado: horasDesde(p.created_at) });
+      }
+    });
+
+    // Clientes reativáveis: já fecharam algo antes, sem pedido novo há 30+ dias.
+    const porCliente = {};
+    (pedidos || []).forEach(p => {
+      if (!p.cliente_id) return;
+      const c = (porCliente[p.cliente_id] ||= { concluiu: false, ultimoPedidoEm: null });
+      if (p.status === 'concluido') c.concluiu = true;
+      if (!c.ultimoPedidoEm || new Date(p.created_at) > new Date(c.ultimoPedidoEm)) c.ultimoPedidoEm = p.created_at;
+    });
+    const reativaveis = Object.entries(porCliente)
+      .filter(([, c]) => c.concluiu && horasDesde(c.ultimoPedidoEm) >= 30 * 24)
+      .map(([email, c]) => ({
+        cliente_email: email,
+        cliente_nome: usuarioPorEmail[email]?.name || 'Sem nome',
+        cliente_whatsapp: usuarioPorEmail[email]?.whatsapp || null,
+        dias_parado: Math.round(horasDesde(c.ultimoPedidoEm) / 24),
+      }));
+
+    const resumoTipo = (tipo) => {
+      const doTipo = itens.filter(i => i.tipo === tipo);
+      return { count: doTipo.length, valor: doTipo.reduce((s, i) => s + i.valor, 0) };
+    };
+    const semProposta = resumoTipo('sem_proposta');
+    const propostaSemResposta = resumoTipo('proposta_sem_resposta');
+    const paradoPosAceite = resumoTipo('parado_pos_aceite');
+
+    res.json({
+      resumo: {
+        sem_proposta: semProposta,
+        proposta_sem_resposta: propostaSemResposta,
+        parado_pos_aceite: paradoPosAceite,
+        clientes_reativaveis: { count: reativaveis.length },
+        dinheiro_na_mesa: semProposta.valor + propostaSemResposta.valor + paradoPosAceite.valor,
+      },
+      itens,
+      reativaveis,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — CUPONS (mês grátis pra quem divulga a plataforma) ───────────────
 // Ver supabase_cupons_migration.sql / buscarCupomValido() / registrarUsoCupom()
 // acima. Criação e ativação/desativação são as únicas mudanças de cupom que
