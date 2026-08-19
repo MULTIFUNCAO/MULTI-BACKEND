@@ -1920,6 +1920,51 @@ app.get('/api/admin/empresas', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — CATEGORIAS ───────────────────────────────────────────────────
+// Fase 1 do plano de CRM. "Buscas" (o que a spec original pedia como
+// primeira coluna) não existe — não há nenhum tracking de busca/visita no
+// app hoje (isso é Fase 3, infra de rastreamento nova). O que dá pra
+// calcular sem infra nova: solicitações (pedidos por categoria), propostas
+// (quantas propostas cada categoria recebeu, via join pedidos->propostas),
+// fechamentos (status 'concluido') e conversão. categoria_servico de
+// usuarios/empresas é array (profissional pode ter mais de uma); pedidos.
+// categoria é sempre um texto único (a categoria daquele pedido
+// específico), que é o que importa aqui.
+app.get('/api/admin/categorias', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pedidos, error } = await supabase
+      .from('pedidos')
+      .select('id,categoria,status');
+    if (error) return res.status(500).json({ error: error.message });
+
+    const pedidoIds = (pedidos || []).map(p => p.id);
+    const { data: propostas } = pedidoIds.length
+      ? await supabase.from('propostas').select('pedido_id').in('pedido_id', pedidoIds)
+      : { data: [] };
+    const catByPedidoId = Object.fromEntries((pedidos || []).map(p => [p.id, p.categoria || 'Sem categoria']));
+
+    const porCategoria = {};
+    const get = (cat) => (porCategoria[cat] ||= { categoria: cat, solicitacoes: 0, propostas: 0, fechamentos: 0 });
+
+    (pedidos || []).forEach(p => {
+      const c = get(p.categoria || 'Sem categoria');
+      c.solicitacoes++;
+      if (p.status === 'concluido') c.fechamentos++;
+    });
+    (propostas || []).forEach(pr => {
+      const cat = catByPedidoId[pr.pedido_id];
+      if (cat) get(cat).propostas++;
+    });
+
+    const categorias = Object.values(porCategoria)
+      .map(c => ({ ...c, conversao: c.solicitacoes ? Math.round((c.fechamentos / c.solicitacoes) * 100) : 0 }))
+      .sort((a, b) => b.solicitacoes - a.solicitacoes);
+
+    res.json({ categorias });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — CUPONS (mês grátis pra quem divulga a plataforma) ───────────────
 // Ver supabase_cupons_migration.sql / buscarCupomValido() / registrarUsoCupom()
 // acima. Criação e ativação/desativação são as únicas mudanças de cupom que
