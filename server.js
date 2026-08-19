@@ -1829,15 +1829,94 @@ app.get('/api/admin/receita', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// 2026-08-18: achado real investigando por que TODA conta cliente aparecia
+// em "Não Fecharam" no Admin (Erika/Rafael/Fabio, ver memória) — mesmo
+// quem tinha fechado serviço de verdade. Esse endpoint devolvia a linha
+// crua de "usuarios", sem nunca calcular "services_count"; o front lia
+// c.services_count (sempre undefined) e tratava como 0 pra qualquer
+// cliente, sem exceção — a aba "Não Fecharam" nunca foi um filtro real,
+// era só "todo mundo". Mesmo padrão de join com "pedidos" que
+// /api/admin/professionals já usa pros profissionais. "completed_count"
+// é o que a UI passa a usar pra decidir fechou/não fechou (status
+// 'concluido' — mesma definição usada na lista de "quem fechou" por
+// categoria); "services_count" continua sendo o total de pedidos (aberto
+// + em andamento + concluído + cancelado), pra não mudar o que já era
+// mostrado como "X serviços" ao lado do nome.
 app.get('/api/admin/clientes', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { data } = await supabase
+    const { data: clientes, error } = await supabase
       .from('usuarios')
       .select('*')
       .eq('role', 'client')
       .order('created_at', { ascending: false });
-    res.json(data || []);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const emails = (clientes || []).map(c => c.email).filter(Boolean);
+    const { data: pedidos } = emails.length
+      ? await supabase.from('pedidos').select('cliente_id,status,valor').in('cliente_id', emails)
+      : { data: [] };
+
+    const result = (clientes || []).map(c => {
+      const seus = (pedidos || []).filter(p => p.cliente_id === c.email);
+      const concluidos = seus.filter(p => p.status === 'concluido');
+      return {
+        ...c,
+        services_count: seus.length,
+        completed_count: concluidos.length,
+        valor_movimentado: concluidos.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+      };
+    });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — EMPRESAS ─────────────────────────────────────────────────────
+// Fase 1 do plano de CRM (ver memória multi_admin_crm_plano). Demandas de
+// empresa entram na mesma tabela "pedidos" que pedidos de cliente comum —
+// NovaDemandaFuncionarioScreen grava cliente_id = email da própria empresa
+// (App.jsx) — então dá pra reaproveitar o mesmo join usado acima pra
+// clientes, só trocando a tabela de origem pra "empresas". Planos pagos de
+// empresa não existem mais (cadastro é sempre grátis agora, ver
+// multi_reforma_modelo_comercial) — não expõe status de assinatura/plano
+// aqui por não haver mais nada real pra mostrar.
+app.get('/api/admin/empresas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: empresas, error } = await supabase
+      .from('empresas')
+      .select('*')
+      .order('criado_em', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const emails = (empresas || []).map(e => e.email).filter(Boolean);
+    const { data: pedidos } = emails.length
+      ? await supabase.from('pedidos').select('cliente_id,status,valor').in('cliente_id', emails)
+      : { data: [] };
+    // Vínculo empresa <-> profissionais/funcionários é via usuarios.empresa_id
+    // (empresa "pro" que também presta serviço) — contagem best-effort, só
+    // pra dar o número pedido na spec, não afeta o resto do endpoint se
+    // falhar.
+    const empresaIds = (empresas || []).map(e => e.id).filter(Boolean);
+    const { data: vinculados } = empresaIds.length
+      ? await supabase.from('usuarios').select('empresa_id').in('empresa_id', empresaIds)
+      : { data: [] };
+
+    const result = (empresas || []).map(e => {
+      const suas = (pedidos || []).filter(p => p.cliente_id === e.email);
+      const aceitas = suas.filter(p => p.status !== 'aberto' && p.status !== 'cancelado');
+      const concluidas = suas.filter(p => p.status === 'concluido');
+      return {
+        ...e,
+        demandas_recebidas: suas.length,
+        demandas_aceitas: aceitas.length,
+        demandas_concluidas: concluidas.length,
+        valor_movimentado: concluidas.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+        taxa_conversao: suas.length ? Math.round((concluidas.length / suas.length) * 100) : 0,
+        qtd_vinculados: (vinculados || []).filter(v => v.empresa_id === e.id).length,
+      };
+    });
+    res.json({ empresas: result });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
