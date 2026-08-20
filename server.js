@@ -2241,10 +2241,19 @@ app.get('/api/admin/cupons/:id/usos', async (req, res) => {
 app.get('/api/admin/professionals', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
+    // role='professional' sozinho deixava de fora quem passou pelo cadastro
+    // profissional (aceitou o termo de autonomia, enviou documentos) mas
+    // teve o passo final que grava role interrompido — achado real 2026-08-20
+    // (casos Fábio/Junior/Adilson): a conta ficava presa em role='client' e,
+    // por causa desse filtro, literalmente invisível aqui, mesmo com docs em
+    // análise — só dava pra aprovar mexendo direto no banco. autonomia_aceita_em
+    // é setado nesse mesmo passo do cadastro (RegisterScreen/
+    // VirarProfissionalScreen em App.jsx), então serve de sinal independente
+    // de "entrou no fluxo profissional" mesmo quando role não bateu.
     const { data: pros, error } = await supabase
       .from('usuarios')
-      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,created_at')
-      .eq('role', 'professional')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,role,autonomia_aceita_em,created_at')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
