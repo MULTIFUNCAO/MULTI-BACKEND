@@ -2571,10 +2571,22 @@ app.post('/api/admin/approve-professional', async (req, res) => {
   // sumir de novo (bug de durabilidade já visto nesse projeto), não pode
   // travar a aprovação em si — approved é o gate real, doc_rg_status é só
   // sincronização de badge.
-  let { error } = await supabase.from('usuarios').update({ approved: true, doc_rg_status: 'verified' }).eq('id', id);
+  //
+  // role: gravado junto a partir de 2026-08-20 — achado real (casos
+  // Fábio/Junior/Adilson) de contas com approved=true sem nunca ter tido
+  // role='professional' gravado de verdade (cadastro interrompido antes do
+  // passo final que grava isso, ver App.jsx RegisterScreen/
+  // VirarProfissionalScreen), o que deixa a conta invisível pro próprio
+  // /api/admin/professionals (filtra role='professional') mesmo já
+  // aprovada — precisou de 3 correções manuais via SQL Editor até agora.
+  // Redundante pro caso normal (role já certo), mas fecha esse buraco pro
+  // caso quebrado; seguro porque esse endpoint só é chamado com o id de
+  // quem já está no fluxo de aprovação de profissional, nunca de conta
+  // empresa.
+  let { error } = await supabase.from('usuarios').update({ approved: true, role: 'professional', doc_rg_status: 'verified' }).eq('id', id);
   if (error) {
-    console.error('[approve-professional] doc_rg_status indisponível, gravando só approved:', error.message);
-    ({ error } = await supabase.from('usuarios').update({ approved: true }).eq('id', id));
+    console.error('[approve-professional] doc_rg_status indisponível, gravando só approved+role:', error.message);
+    ({ error } = await supabase.from('usuarios').update({ approved: true, role: 'professional' }).eq('id', id));
   }
   if (error) return res.status(500).json({ error: error.message });
   log('PROFISSIONAL APROVADO', { id });
