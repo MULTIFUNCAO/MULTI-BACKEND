@@ -2255,6 +2255,9 @@ app.get('/api/admin/professionals', async (req, res) => {
       .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,role,autonomia_aceita_em,created_at')
       .or('role.eq.professional,autonomia_aceita_em.not.is.null')
       .order('created_at', { ascending: false });
+    // DEBUG TEMPORÁRIO 2026-08-20 — remover depois de confirmar o filtro
+    // acima ao vivo (achado testando role Thiago/anacristinal1401@gmail.com).
+    log('DEBUG professionals', { erro: error?.message || null, total: pros?.length || 0, temThiago: !!(pros || []).find(p => p.id === '7e6a2ff8-0abd-4fea-b02f-5113b5a49b5d') });
     if (error) return res.status(500).json({ error: error.message });
 
     const emails = (pros || []).map(p => p.email).filter(Boolean);
