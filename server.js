@@ -2595,14 +2595,18 @@ app.post('/api/admin/approve-professional', async (req, res) => {
   // caso quebrado; seguro porque esse endpoint só é chamado com o id de
   // quem já está no fluxo de aprovação de profissional, nunca de conta
   // empresa.
-  let { error } = await supabase.from('usuarios').update({ approved: true, role: 'professional', doc_rg_status: 'verified' }).eq('id', id);
+  let { data, error } = await supabase.from('usuarios').update({ approved: true, role: 'professional', doc_rg_status: 'verified' }).eq('id', id).select('id,role,approved,doc_rg_status');
   if (error) {
     console.error('[approve-professional] doc_rg_status indisponível, gravando só approved+role:', error.message);
-    ({ error } = await supabase.from('usuarios').update({ approved: true, role: 'professional' }).eq('id', id));
+    ({ data, error } = await supabase.from('usuarios').update({ approved: true, role: 'professional' }).eq('id', id).select('id,role,approved,doc_rg_status'));
   }
   if (error) return res.status(500).json({ error: error.message });
-  log('PROFISSIONAL APROVADO', { id });
-  res.json({ success: true });
+  log('PROFISSIONAL APROVADO', { id, linhasAfetadas: data?.length || 0 });
+  // DEBUG TEMPORÁRIO 2026-08-20 — devolve a linha realmente afetada (ou
+  // vazio, se 0 linhas bateram no .eq('id', id) — RLS/permissão silenciosa
+  // dão exatamente isso, sem erro) pra inspecionar direto no DevTools sem
+  // depender dos logs do Render. Remover depois de confirmado.
+  res.json({ success: true, debugLinhasAfetadas: data?.length || 0, debugLinha: data?.[0] || null });
 });
 
 app.post('/api/admin/reject-professional', async (req, res) => {
