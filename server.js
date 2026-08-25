@@ -13,6 +13,20 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 const allowedOrigins = [process.env.FRONTEND_URL, "https://floragestao.com.br", "https://localhost", "capacitor://localhost", "http://localhost"].filter(Boolean);
+// Aceita também a variante com/sem "www." de FRONTEND_URL. Achado
+// 2026-08-24: cliente reportou "Failed to fetch" travado em "Criando
+// conta..." no site; www.multifuncao.com.br serve o site normalmente (sem
+// redirect pro domínio raiz), mas só "https://multifuncao.com.br" (sem www)
+// estava na lista — qualquer visitante que chegasse pelo www tinha TODA
+// chamada de API bloqueada por CORS, confirmado reproduzindo direto com
+// curl contra o backend em produção (204 sem www, 500 com www).
+if (process.env.FRONTEND_URL) {
+  try {
+    const u = new URL(process.env.FRONTEND_URL);
+    const altHost = u.hostname.startsWith("www.") ? u.hostname.slice(4) : "www." + u.hostname;
+    allowedOrigins.push(`${u.protocol}//${altHost}`);
+  } catch (_) { /* FRONTEND_URL mal formada — ignora, resto da lista continua valendo */ }
+}
 // Previews do Vercel (deploy de teste do MULTI antes de ir pra produção)
 // ganham uma URL aleatória tipo https://multi-<hash>-anacristinal1401-2650s-projects.vercel.app
 // a cada "vercel deploy" — não dá pra colocar fixo em allowedOrigins. Libera
@@ -23,7 +37,11 @@ app.use(cors({
     if (!origin) return callback(null, true); // requisições sem Origin (curl, server-to-server)
     if (!allowedOrigins.length) return callback(null, true);
     if (allowedOrigins.includes(origin) || previewOriginRegex.test(origin)) return callback(null, true);
-    callback(new Error("Not allowed by CORS"));
+    // callback(null, false) em vez de callback(new Error(...)): nega sem
+    // acionar o error handler padrão do Express (que respondia 500 genérico
+    // pra origem simplesmente não-permitida, poluindo os logs do Render
+    // como se fosse erro de servidor).
+    callback(null, false);
   },
 }));
 app.use(express.json());
