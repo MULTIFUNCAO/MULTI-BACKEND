@@ -799,13 +799,16 @@ app.post("/api/auth/solicitar-codigo", async (req, res) => {
     await mailer.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
     res.json({ ok: true });
   } catch(e) {
-    // DEBUG TEMPORÁRIO 2026-08-25 — expõe o erro real da Brevo na resposta
-    // pra diagnosticar a migração do SendGrid sem depender dos logs do
-    // Render (sem acesso a eles nesta sessão). Remover o campo "detail"
-    // depois de confirmado (não deve vazar detalhe de provedor de e-mail
-    // em produção pra sempre).
-    console.error("[solicitar-codigo] erro Brevo:", e.response?.data || e.message);
-    res.status(500).json({ error: "Erro ao enviar email", detail: e.response?.data || e.message });
+    // DEBUG TEMPORÁRIO 2026-08-25 — expõe o erro real da Brevo + um preview
+    // mascarado de BREVO_API_KEY (mesmo padrão que existia pro SendGrid,
+    // ver keyPreview removido) na resposta, pra diagnosticar a migração
+    // sem depender dos logs do Render (sem acesso a eles nesta sessão).
+    // Remover depois de confirmado — não deve vazar isso em produção
+    // pra sempre, nem o preview mascarado.
+    const k = process.env.BREVO_API_KEY;
+    const keyPreview = k ? (k.length <= 14 ? "MUITO CURTA:" + k.length + "chars" : k.slice(0,6) + "..." + k.slice(-4) + " (" + k.length + " chars)") : "NÃO DEFINIDA ⚠️";
+    console.error("[solicitar-codigo] erro Brevo:", e.response?.data || e.message, "| BREVO_API_KEY:", keyPreview);
+    res.status(500).json({ error: "Erro ao enviar email", detail: e.response?.data || e.message, keyPreview });
   }
 });
 
