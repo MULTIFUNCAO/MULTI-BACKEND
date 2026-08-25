@@ -972,6 +972,61 @@ app.post("/api/webhook-asaas", async (req, res) => {
   res.sendStatus(200);
 });
 
+// ── WEBHOOK ASAAS — validação de saque/transferência ───────────────────────
+// Mecanismo opcional da Asaas (User Menu > Integrações > Mecanismos de
+// Segurança na Asaas): quando ATIVADO LÁ (não confundir com esse endpoint
+// existir — a Asaas só chama isso se o mecanismo estiver ligado no painel
+// deles), toda transferência/saque solicitado passa a esperar essa validação
+// em vez do token SMS/app padrão. A Asaas manda esse POST ~5s depois de cada
+// transferência pedida e espera {"status":"APPROVED"} ou
+// {"status":"REFUSED","refuseReason":"..."} de volta — se a chamada falhar
+// 3x ou não devolver um status válido, a operação é CANCELADA (inclusive
+// saque manual pelo painel, se o mecanismo lá estiver marcado pra cobrir
+// também a interface web, não só a API).
+//
+// IMPORTANTE — ainda NÃO ativado no painel da Asaas de propósito (ver
+// [[multi_modelo_comissao_pagamento_intermediado]]): nada no backend chama
+// POST /transfers ainda (Fase 6 do modelo de comissão não existe), então
+// não há nenhuma transferência legítima pra aprovar hoje. Esse endpoint
+// existe só pra já estar no ar, testado, ANTES de ativar o mecanismo lá —
+// só ativar depois de confirmar que ele responde certo (ver instrução de
+// teste no final do arquivo de migration/notas). Até a Fase 6 existir de
+// verdade (com pedidos.valor_repasse/pix_key gravados e o transfer.id
+// reservado no momento da criação), esse handler RECUSA por padrão —
+// fail-closed de propósito, mesmo raciocínio do /api/webhook-asaas de
+// pagamento: melhor barrar uma transferência legítima por engano (o
+// profissional só ficaria alguns minutos sem receber, corrigível manual)
+// do que aprovar automaticamente algo que não conseguimos conferir de
+// verdade ainda.
+//
+// Mesmo padrão de header de auth do webhook de pagamento
+// (asaas-access-token), mas token PRÓPRIO — ASAAS_TRANSFER_VALIDATION_TOKEN,
+// não o mesmo ASAAS_WEBHOOK_TOKEN do webhook de pagamento, porque são duas
+// URLs/configurações separadas no painel da Asaas.
+app.post("/api/webhook-asaas-validar-transferencia", async (req, res) => {
+  const token = process.env.ASAAS_TRANSFER_VALIDATION_TOKEN;
+  if (!token || req.headers["asaas-access-token"] !== token) {
+    console.warn("[WEBHOOK-TRANSFER] Token ausente ou inválido — recusando por segurança");
+    return res.status(200).json({ status: "REFUSED", refuseReason: "Token de validação ausente ou inválido" });
+  }
+
+  const { type, transfer } = req.body || {};
+  log("WEBHOOK-TRANSFER recebido", { type, id: transfer?.id, value: transfer?.value, externalReference: transfer?.externalReference });
+
+  // TODO (Fase 6 do modelo de comissão): trocar este REFUSED fixo por uma
+  // conferência real — buscar em "pedidos" a linha com
+  // repasse_asaas_transfer_id = transfer.id (gravado no momento em que
+  // fizemos o POST /transfers), validar que transfer.value bate com
+  // pedidos.valor_repasse, que transfer.pixAddressKey bate com o pix_key
+  // cadastrado pelo profissional daquele pedido, e que ainda não foi
+  // aprovado antes (idempotência). Só então {"status":"APPROVED"}.
+  console.warn("[WEBHOOK-TRANSFER] Recusado — Fase 6 (repasse) ainda não implementada, nenhuma transferência é esperada hoje", transfer?.id);
+  return res.status(200).json({
+    status: "REFUSED",
+    refuseReason: "Multi: validação automática ainda não implementada — nenhuma transferência via API é esperada neste momento",
+  });
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // ASSINATURA (usuarios/empresas + tabela "assinaturas") — cobrança real via
 // Asaas, substitui o antigo trial de 7 dias criado direto pelo frontend.
@@ -980,9 +1035,16 @@ app.post("/api/webhook-asaas", async (req, res) => {
 // esse endpoint é o ÚNICO jeito de um plano virar "ativa".
 // ════════════════════════════════════════════════════════════════════════════
 const PLANOS_ASSINATURA = {
-  autonomo: { valor: 29.90,  label: "Multi Autônomo" },
-  pro:      { valor: 59.90,  label: "Multi Pro" },
-  premium:  { valor: 129.90, label: "Multi Premium" },
+  autonomo:     { valor: 29.90,  label: "Multi Autônomo" },
+  pro:          { valor: 59.90,  label: "Multi Pro" },
+  premium:      { valor: 129.90, label: "Multi Premium" },
+  // Planos de empresa parceira, reintroduzidos 2026-08-19 (ver PLANOS_EMPRESA
+  // em MULTI/src/App.jsx) — mesmo motor de cobrança do profissional, só troca
+  // titularTipo pra "empresa" (a constraint de assinaturas.plano no banco já
+  // aceitava esses dois valores mesmo com a monetização de empresa desligada
+  // no front, confirmado ao vivo antes de reativar).
+  empresa:      { valor: 149.90, label: "Multi Empresa" },
+  empresa_plus: { valor: 299.90, label: "Multi Empresa Plus" },
 };
 
 // Limites de negócio (categoria/valor/quantidade) por plano do profissional.
@@ -1158,14 +1220,21 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
     cardNumber, cardHolder, expiryMonth, expiryYear, cvv, cpf, phone,
   } = req.body || {};
 
-  // Planos pagos de empresa deixaram de existir — só profissional (titular_tipo
-  // "usuario") pode assinar a partir daqui. Assinaturas "empresa"/"empresa_plus"
-  // já existentes continuam válidas no banco (ver supabase_planos_premium_migration.sql),
-  // só não é mais possível criar novas por aqui.
-  if (titularTipo !== "usuario")
+  // Planos de empresa voltaram a existir (2026-08-19) — titular_tipo "usuario"
+  // (profissional) e "empresa" são os dois aceitos aqui agora, mesmo padrão
+  // de validação pros dois (PLANOS_ASSINATURA cruza plano×titularTipo).
+  if (titularTipo !== "usuario" && titularTipo !== "empresa")
     return res.status(400).json({ error: "titularTipo inválido" });
   const planoInfo = PLANOS_ASSINATURA[plano];
   if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+  // Plano de empresa não pode ser cobrado com titularTipo "usuario" e
+  // vice-versa — mesmo tipo de checagem cruzada que o CHECK constraint do
+  // banco já faz, mas falhar aqui com uma mensagem clara é melhor que deixar
+  // o insert em "assinaturas" estourar um erro genérico de constraint lá na
+  // frente.
+  const planoEhDeEmpresa = plano === "empresa" || plano === "empresa_plus";
+  if (planoEhDeEmpresa !== (titularTipo === "empresa"))
+    return res.status(400).json({ error: "Plano não corresponde ao tipo de titular" });
   if (!titularEmail || !cardNumber || !cardHolder || !expiryMonth || !expiryYear || !cvv || !cpf)
     return res.status(400).json({ error: "Dados de pagamento incompletos" });
 
@@ -1279,10 +1348,14 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
 app.post("/api/assinatura/gerar-pix", async (req, res) => {
   const { titularTipo, titularEmail, titularNome, plano, cpf, phone, cupom } = req.body || {};
 
-  if (titularTipo !== "usuario")
+  // Mesma regra de /cobrar (planos de empresa voltaram 2026-08-19).
+  if (titularTipo !== "usuario" && titularTipo !== "empresa")
     return res.status(400).json({ error: "titularTipo inválido" });
   const planoInfo = PLANOS_ASSINATURA[plano];
   if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+  const planoEhDeEmpresaPix = plano === "empresa" || plano === "empresa_plus";
+  if (planoEhDeEmpresaPix !== (titularTipo === "empresa"))
+    return res.status(400).json({ error: "Plano não corresponde ao tipo de titular" });
   if (!titularEmail || !cpf)
     return res.status(400).json({ error: "Dados incompletos" });
 
@@ -2573,6 +2646,25 @@ app.post('/api/admin/moedas/creditar-manual', async (req, res) => {
   }
 });
 
+// Reconfere depois do write se os campos realmente gravaram — mitigação pro
+// bug de durabilidade recorrente desse projeto Supabase (write responde
+// sucesso, mas reverte sozinho segundos depois; um retry imediato costuma
+// "pegar" na 2ª tentativa, achado ao vivo com o caso Adilson Ribeiro
+// 2026-08-24). Não resolve a causa raiz (infra do Supabase, ticket aberto
+// com o suporte), só evita a aprovação "fantasma" que o admin via até agora.
+async function updateComVerificacao(tabela, id, campos, camposEsperados, tentativas = 3) {
+  let data = null, error = null;
+  for (let i = 0; i < tentativas; i++) {
+    ({ data, error } = await supabase.from(tabela).update(campos).eq('id', id).select(Object.keys(camposEsperados).join(',')));
+    if (error) break;
+    const linha = data?.[0];
+    const bateu = linha && Object.entries(camposEsperados).every(([k, v]) => linha[k] === v);
+    if (bateu) return { data, error: null, tentativasGastas: i + 1, confirmado: true };
+    if (i + 1 < tentativas) await new Promise(r => setTimeout(r, 700));
+  }
+  return { data, error, tentativasGastas: tentativas, confirmado: false };
+}
+
 app.post('/api/admin/approve-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
@@ -2595,32 +2687,63 @@ app.post('/api/admin/approve-professional', async (req, res) => {
   // caso quebrado; seguro porque esse endpoint só é chamado com o id de
   // quem já está no fluxo de aprovação de profissional, nunca de conta
   // empresa.
-  let { data, error } = await supabase.from('usuarios').update({ approved: true, role: 'professional', doc_rg_status: 'verified' }).eq('id', id).select('id,role,approved,doc_rg_status');
+  let { data, error, tentativasGastas, confirmado } = await updateComVerificacao(
+    'usuarios', id,
+    { approved: true, role: 'professional', doc_rg_status: 'verified' },
+    { approved: true, role: 'professional', doc_rg_status: 'verified' }
+  );
   if (error) {
     console.error('[approve-professional] doc_rg_status indisponível, gravando só approved+role:', error.message);
-    ({ data, error } = await supabase.from('usuarios').update({ approved: true, role: 'professional' }).eq('id', id).select('id,role,approved,doc_rg_status'));
+    ({ data, error, tentativasGastas, confirmado } = await updateComVerificacao(
+      'usuarios', id,
+      { approved: true, role: 'professional' },
+      { approved: true, role: 'professional' }
+    ));
   }
   if (error) return res.status(500).json({ error: error.message });
-  log('PROFISSIONAL APROVADO', { id, linhasAfetadas: data?.length || 0 });
+  log('PROFISSIONAL APROVADO', { id, linhasAfetadas: data?.length || 0, tentativasGastas, confirmado });
+  if (!confirmado) {
+    // Reconfirmação pós-write não bateu em nenhuma das tentativas — não é
+    // seguro dizer "aprovado" pro admin. Reporta erro em vez de sucesso
+    // fantasma; o front deve deixar o botão disponível pra tentar de novo.
+    return res.status(502).json({
+      error: 'A escrita não foi confirmada após ' + tentativasGastas + ' tentativa(s) — provável instabilidade do Supabase. Tente novamente.',
+      debugLinhasAfetadas: data?.length || 0,
+      debugLinha: data?.[0] || null,
+    });
+  }
   // DEBUG TEMPORÁRIO 2026-08-20 — devolve a linha realmente afetada (ou
   // vazio, se 0 linhas bateram no .eq('id', id) — RLS/permissão silenciosa
   // dão exatamente isso, sem erro) pra inspecionar direto no DevTools sem
   // depender dos logs do Render. Remover depois de confirmado.
-  res.json({ success: true, debugLinhasAfetadas: data?.length || 0, debugLinha: data?.[0] || null });
+  res.json({ success: true, debugLinhasAfetadas: data?.length || 0, debugLinha: data?.[0] || null, tentativasGastas });
 });
 
 app.post('/api/admin/reject-professional', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { id } = req.body || {};
   if (!id) return res.status(400).json({ error: 'id é obrigatório' });
-  let { error } = await supabase.from('usuarios').update({ approved: false, doc_rg_status: 'rejected' }).eq('id', id);
+  let { data, error, tentativasGastas, confirmado } = await updateComVerificacao(
+    'usuarios', id,
+    { approved: false, doc_rg_status: 'rejected' },
+    { approved: false, doc_rg_status: 'rejected' }
+  );
   if (error) {
     console.error('[reject-professional] doc_rg_status indisponível, gravando só approved:', error.message);
-    ({ error } = await supabase.from('usuarios').update({ approved: false }).eq('id', id));
+    ({ data, error, tentativasGastas, confirmado } = await updateComVerificacao(
+      'usuarios', id,
+      { approved: false },
+      { approved: false }
+    ));
   }
   if (error) return res.status(500).json({ error: error.message });
-  log('PROFISSIONAL REPROVADO', { id });
-  res.json({ success: true });
+  log('PROFISSIONAL REPROVADO', { id, tentativasGastas, confirmado });
+  if (!confirmado) {
+    return res.status(502).json({
+      error: 'A escrita não foi confirmada após ' + tentativasGastas + ' tentativa(s) — provável instabilidade do Supabase. Tente novamente.',
+    });
+  }
+  res.json({ success: true, tentativasGastas });
 });
 
 // Cancela uma assinatura manualmente — criada pra limpar as duas linhas
