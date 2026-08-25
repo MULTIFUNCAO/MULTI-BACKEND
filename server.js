@@ -8,7 +8,7 @@ const express  = require("express");
 const axios    = require("axios");
 const cors     = require("cors");
 const crypto   = require("crypto");
-const sgMail   = require("@sendgrid/mail");
+const nodemailer = require("nodemailer");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -73,14 +73,39 @@ function supabaseAuthOnly() {
   });
 }
 
-// ─── SendGrid ────────────────────────────────────────────────────────────────
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+// ─── Brevo (ex-Sendinblue) via SMTP ────────────────────────────────────────
+// Trocado do SendGrid 2026-08-25: trial do SendGrid expirou e não tinha
+// orçamento pra assinar; Brevo tem plano grátis permanente (300 e-mails/dia,
+// sem cartão). Usa nodemailer (SMTP genérico) em vez do SDK oficial da
+// Brevo — mais simples de trocar de novo no futuro se precisar (só troca o
+// transporter, o resto do código nem sabe que mudou de provedor).
+//
+// Credenciais em Brevo > SMTP & API > SMTP (login) + SMTP keys (senha) —
+// NÃO é a senha da conta Brevo, é uma chave separada gerada nessa tela.
+// mailer.send() imita de propósito a assinatura do antigo client de
+// e-mail ({to, from, subject, html}), pra não precisar tocar nos ~6 call
+// sites que já existiam.
+const brevoTransport = nodemailer.createTransport({
+  host: "smtp-relay.brevo.com",
+  port: 587,
+  secure: false, // STARTTLS na porta 587, não SSL direto
+  auth: {
+    user: process.env.BREVO_SMTP_LOGIN,
+    pass: process.env.BREVO_SMTP_KEY,
+  },
+});
+const mailer = {
+  send({ to, from, subject, html }) {
+    const fromNormalizado = typeof from === "string"
+      ? from
+      : `"${from?.name || ""}" <${from?.email || from?.address || FROM}>`;
+    return brevoTransport.sendMail({ to, from: fromNormalizado, subject, html });
+  },
+};
 const FROM    = "contato@multifuncao.com.br";
 const APP_URL = "https://multifuncao.com.br";
-const keyPreview = process.env.SENDGRID_API_KEY
-  ? process.env.SENDGRID_API_KEY.slice(0,10) + "..." + process.env.SENDGRID_API_KEY.slice(-4)
-  : "NÃO DEFINIDA ⚠️";
-console.log("[SENDGRID] Chave carregada:", keyPreview);
+console.log("[BREVO] Login carregado:", process.env.BREVO_SMTP_LOGIN ? "sim" : "NÃO DEFINIDO ⚠️",
+  "| Chave carregada:", process.env.BREVO_SMTP_KEY ? "sim" : "NÃO DEFINIDA ⚠️");
 
 // ─── Asaas ───────────────────────────────────────────────────────────────────
 // A Asaas migrou o domínio da API — www.asaas.com/sandbox.asaas.com eram os
@@ -196,7 +221,7 @@ app.post("/api/email/boas-vindas", async (req, res) => {
   `;
 
   try {
-    await sgMail.send({ to: email, from: FROM, subject, html: layout(body) });
+    await mailer.send({ to: email, from: FROM, subject, html: layout(body) });
     log("EMAIL BOAS-VINDAS", { email, role });
     res.json({ ok: true, message: `E-mail de boas-vindas enviado para ${email}` });
   } catch (e) {
@@ -232,7 +257,7 @@ app.post("/api/email/servico", async (req, res) => {
   `;
 
   try {
-    await sgMail.send({ to: email, from: FROM, subject: `✅ Pedido confirmado — Protocolo ${protocolo}`, html: layout(body) });
+    await mailer.send({ to: email, from: FROM, subject: `✅ Pedido confirmado — Protocolo ${protocolo}`, html: layout(body) });
     log("EMAIL SERVICO", { email, serviceTitle, protocolo });
     res.json({ ok: true, protocolo });
   } catch (e) {
@@ -276,7 +301,7 @@ app.post("/api/email/campanha", async (req, res) => {
         ${cta ? `<div style="margin:24px 0"><a href="${ctaUrl || APP_URL}" style="display:inline-block;background:linear-gradient(135deg,#FF5722,#E64A19);color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700">${cta} →</a></div>` : ""}
       `;
       try {
-        await sgMail.send({ to: dest.email, from: FROM, subject, html: layout(body) });
+        await mailer.send({ to: dest.email, from: FROM, subject, html: layout(body) });
         enviados++;
       } catch { falhas++; }
     }));
@@ -487,7 +512,7 @@ app.post("/webhook/asaas", async (req, res) => {
 
   // Send confirmation email
   if (user?.email) {
-    sgMail.send({
+    mailer.send({
       to: user.email, from: FROM,
       subject: "🚀 Acesso PRO liberado! Boas vendas!",
       html: layout(`
@@ -776,7 +801,7 @@ app.post("/api/auth/solicitar-codigo", async (req, res) => {
   const { error: dbError } = await supabase.from("password_reset_codes").upsert({ email, code, expires_at: expiresAt });
   if (dbError) return res.status(500).json({ error: "Erro ao gerar codigo" });
   try {
-    await sgMail.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
+    await mailer.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: "Erro ao enviar email" }); }
 });
@@ -2920,7 +2945,7 @@ app.post('/api/admin/send-campaign', async (req, res) => {
           <div style="color:#555;line-height:1.8;font-size:14px">${body.replace(/\n/g, '<br>')}</div>
         `;
         try {
-          await sgMail.send({ to: dest.email, from: FROM, subject, html: layout(html) });
+          await mailer.send({ to: dest.email, from: FROM, subject, html: layout(html) });
           sent++;
         } catch { falhas++; }
       }));
