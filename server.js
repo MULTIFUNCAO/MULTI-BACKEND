@@ -8,7 +8,6 @@ const express  = require("express");
 const axios    = require("axios");
 const cors     = require("cors");
 const crypto   = require("crypto");
-const nodemailer = require("nodemailer");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -73,39 +72,35 @@ function supabaseAuthOnly() {
   });
 }
 
-// ─── Brevo (ex-Sendinblue) via SMTP ────────────────────────────────────────
+// ─── Brevo (ex-Sendinblue) via API HTTP ────────────────────────────────────
 // Trocado do SendGrid 2026-08-25: trial do SendGrid expirou e não tinha
 // orçamento pra assinar; Brevo tem plano grátis permanente (300 e-mails/dia,
-// sem cartão). Usa nodemailer (SMTP genérico) em vez do SDK oficial da
-// Brevo — mais simples de trocar de novo no futuro se precisar (só troca o
-// transporter, o resto do código nem sabe que mudou de provedor).
+// sem cartão). Primeira tentativa foi SMTP (nodemailer, porta 587) — deu
+// timeout de ~2min no Render (mas porta 587 abre normal fora do Render,
+// confirmado testando direto), sintoma clássico de plataforma cloud
+// bloqueando saída SMTP. Trocado pra API HTTP da Brevo (porta 443, mesma
+// que Asaas/Supabase já usam) via axios, sem esse problema.
 //
-// Credenciais em Brevo > SMTP & API > SMTP (login) + SMTP keys (senha) —
-// NÃO é a senha da conta Brevo, é uma chave separada gerada nessa tela.
-// mailer.send() imita de propósito a assinatura do antigo client de
-// e-mail ({to, from, subject, html}), pra não precisar tocar nos ~6 call
-// sites que já existiam.
-const brevoTransport = nodemailer.createTransport({
-  host: "smtp-relay.brevo.com",
-  port: 587,
-  secure: false, // STARTTLS na porta 587, não SSL direto
-  auth: {
-    user: process.env.BREVO_SMTP_LOGIN,
-    pass: process.env.BREVO_SMTP_KEY,
-  },
+// Credencial: Brevo > SMTP & API > API Keys > gerar nova chave (BREVO_API_KEY
+// — diferente da chave SMTP, essa é só pra API). mailer.send() imita de
+// propósito a assinatura do antigo client de e-mail ({to, from, subject,
+// html}), pra não precisar tocar nos ~6 call sites que já existiam.
+const brevoApi = axios.create({
+  baseURL: "https://api.brevo.com/v3",
+  headers: { "api-key": process.env.BREVO_API_KEY, "Content-Type": "application/json" },
+  timeout: 15000,
 });
 const mailer = {
-  send({ to, from, subject, html }) {
-    const fromNormalizado = typeof from === "string"
-      ? from
-      : `"${from?.name || ""}" <${from?.email || from?.address || FROM}>`;
-    return brevoTransport.sendMail({ to, from: fromNormalizado, subject, html });
+  async send({ to, from, subject, html }) {
+    const sender = typeof from === "string"
+      ? { email: from }
+      : { name: from?.name, email: from?.email || from?.address || FROM };
+    await brevoApi.post("/smtp/email", { sender, to: [{ email: to }], subject, htmlContent: html });
   },
 };
 const FROM    = "contato@multifuncao.com.br";
 const APP_URL = "https://multifuncao.com.br";
-console.log("[BREVO] Login carregado:", process.env.BREVO_SMTP_LOGIN ? "sim" : "NÃO DEFINIDO ⚠️",
-  "| Chave carregada:", process.env.BREVO_SMTP_KEY ? "sim" : "NÃO DEFINIDA ⚠️");
+console.log("[BREVO] Chave de API carregada:", process.env.BREVO_API_KEY ? "sim" : "NÃO DEFINIDA ⚠️");
 
 // ─── Asaas ───────────────────────────────────────────────────────────────────
 // A Asaas migrou o domínio da API — www.asaas.com/sandbox.asaas.com eram os
@@ -225,9 +220,9 @@ app.post("/api/email/boas-vindas", async (req, res) => {
     log("EMAIL BOAS-VINDAS", { email, role });
     res.json({ ok: true, message: `E-mail de boas-vindas enviado para ${email}` });
   } catch (e) {
-    const sgErr = e.response?.body || e.message;
-    log("ERRO boas-vindas", sgErr);
-    res.status(500).json({ error: "Falha ao enviar e-mail", detail: sgErr });
+    const mailErr = e.response?.data || e.message;
+    log("ERRO boas-vindas", mailErr);
+    res.status(500).json({ error: "Falha ao enviar e-mail", detail: mailErr });
   }
 });
 
@@ -261,7 +256,7 @@ app.post("/api/email/servico", async (req, res) => {
     log("EMAIL SERVICO", { email, serviceTitle, protocolo });
     res.json({ ok: true, protocolo });
   } catch (e) {
-    log("ERRO servico", e.response?.body || e.message);
+    log("ERRO servico", e.response?.data || e.message);
     res.status(500).json({ error: "Falha ao enviar e-mail" });
   }
 });
