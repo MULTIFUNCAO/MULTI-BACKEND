@@ -798,7 +798,15 @@ app.post("/api/auth/solicitar-codigo", async (req, res) => {
   try {
     await mailer.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
     res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: "Erro ao enviar email" }); }
+  } catch(e) {
+    // DEBUG TEMPORÁRIO 2026-08-25 — expõe o erro real da Brevo na resposta
+    // pra diagnosticar a migração do SendGrid sem depender dos logs do
+    // Render (sem acesso a eles nesta sessão). Remover o campo "detail"
+    // depois de confirmado (não deve vazar detalhe de provedor de e-mail
+    // em produção pra sempre).
+    console.error("[solicitar-codigo] erro Brevo:", e.response?.data || e.message);
+    res.status(500).json({ error: "Erro ao enviar email", detail: e.response?.data || e.message });
+  }
 });
 
 app.post("/api/auth/verificar-codigo", async (req, res) => {
