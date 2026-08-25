@@ -788,20 +788,6 @@ app.post("/api/auth/redefinir-senha", async (req, res) => {
 // Jhonatan: o objeto `resetCodes = {}` em memória se perdia em qualquer
 // restart do backend (deploy, crash, sleep do Render) — código pendente
 // virava inválido sem nenhum aviso pro usuário, mesmo digitando certo.
-// DEBUG TEMPORÁRIO 2026-08-25 — GET simples, sem depender de mandar e-mail
-// de verdade nem de bater na Brevo, só pra confirmar se o Render está
-// aplicando o valor atual de BREVO_API_KEY no processo rodando. Isola a
-// pergunta "o Render aplicou a env var?" do resto (chave errada, IP
-// bloqueado, etc). Preview mascarado, mesma lógica do catch abaixo.
-// Remover junto com o resto do debug depois de confirmado.
-// (marca de deploy: forçando um deploy via git push, não só "Manual
-// Deploy" no dashboard, pra testar se é isso que estava fazendo o Render
-// não recarregar BREVO_API_KEY)
-app.get("/api/debug/brevo-key", (req, res) => {
-  const k = process.env.BREVO_API_KEY;
-  const keyPreview = k ? (k.length <= 14 ? "MUITO CURTA:" + k.length + "chars" : k.slice(0,6) + "..." + k.slice(-4) + " (" + k.length + " chars)") : "NÃO DEFINIDA ⚠️";
-  res.json({ keyPreview });
-});
 app.post("/api/auth/solicitar-codigo", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Email obrigatorio" });
@@ -813,16 +799,8 @@ app.post("/api/auth/solicitar-codigo", async (req, res) => {
     await mailer.send({ to: email, from: { name: "Multi Servicos", email: "contato@multifuncao.com.br" }, subject: "Seu codigo de recuperacao - Multi", html: "<h2>Codigo: " + code + "</h2><p>Expira em 15 minutos.</p>" });
     res.json({ ok: true });
   } catch(e) {
-    // DEBUG TEMPORÁRIO 2026-08-25 — expõe o erro real da Brevo + um preview
-    // mascarado de BREVO_API_KEY (mesmo padrão que existia pro SendGrid,
-    // ver keyPreview removido) na resposta, pra diagnosticar a migração
-    // sem depender dos logs do Render (sem acesso a eles nesta sessão).
-    // Remover depois de confirmado — não deve vazar isso em produção
-    // pra sempre, nem o preview mascarado.
-    const k = process.env.BREVO_API_KEY;
-    const keyPreview = k ? (k.length <= 14 ? "MUITO CURTA:" + k.length + "chars" : k.slice(0,6) + "..." + k.slice(-4) + " (" + k.length + " chars)") : "NÃO DEFINIDA ⚠️";
-    console.error("[solicitar-codigo] erro Brevo:", e.response?.data || e.message, "| BREVO_API_KEY:", keyPreview);
-    res.status(500).json({ error: "Erro ao enviar email", detail: e.response?.data || e.message, keyPreview });
+    console.error("[solicitar-codigo] erro ao enviar email:", e.response?.data || e.message);
+    res.status(500).json({ error: "Erro ao enviar email" });
   }
 });
 
