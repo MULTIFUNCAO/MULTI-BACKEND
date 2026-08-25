@@ -794,6 +794,9 @@ app.post("/api/auth/redefinir-senha", async (req, res) => {
 // pergunta "o Render aplicou a env var?" do resto (chave errada, IP
 // bloqueado, etc). Preview mascarado, mesma lógica do catch abaixo.
 // Remover junto com o resto do debug depois de confirmado.
+// (marca de deploy: forçando um deploy via git push, não só "Manual
+// Deploy" no dashboard, pra testar se é isso que estava fazendo o Render
+// não recarregar BREVO_API_KEY)
 app.get("/api/debug/brevo-key", (req, res) => {
   const k = process.env.BREVO_API_KEY;
   const keyPreview = k ? (k.length <= 14 ? "MUITO CURTA:" + k.length + "chars" : k.slice(0,6) + "..." + k.slice(-4) + " (" + k.length + " chars)") : "NÃO DEFINIDA ⚠️";
