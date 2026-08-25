@@ -12,7 +12,7 @@ const sgMail   = require("@sendgrid/mail");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-const allowedOrigins = [process.env.FRONTEND_URL, "https://floragestao.com.br", "https://localhost", "capacitor://localhost", "http://localhost"].filter(Boolean);
+const allowedOrigins = [process.env.FRONTEND_URL, "https://localhost", "capacitor://localhost", "http://localhost"].filter(Boolean);
 // Aceita também a variante com/sem "www." de FRONTEND_URL. Achado
 // 2026-08-24: cliente reportou "Failed to fetch" travado em "Criando
 // conta..." no site; www.multifuncao.com.br serve o site normalmente (sem
