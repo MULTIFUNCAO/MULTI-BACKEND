@@ -760,9 +760,15 @@ app.post("/api/auth/login", async (req, res) => {
     // — mas o fallback devia refletir o role real mesmo assim. "isPro" não
     // existe em "usuarios" (o app decide isso via "assinaturas", não por
     // aqui) — mantido como false só pra não quebrar o formato da resposta.
-    const { data: profile } = await supabase.from("usuarios").select("name, role").eq("email", email).maybeSingle();
+    const { data: profile } = await supabase.from("usuarios").select("name, role, approved").eq("email", email).maybeSingle();
+    // profile.role pode estar preso em "client" mesmo pra conta aprovada
+    // (mesmo bug do item 1 em /api/moedas/gerar-pix — approve-professional
+    // que não gravou role de verdade, casos Fábio/Junior/Adilson). Sem essa
+    // conferência o fallback devolvia "client" pra um profissional de
+    // verdade sempre que a releitura do front falhasse.
+    const roleFallback = profile?.role || (profile?.approved ? "professional" : "client");
     log("LOGIN", { email });
-    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: false } });
+    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: roleFallback, isPro: false } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
