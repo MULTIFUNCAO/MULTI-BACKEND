@@ -719,7 +719,12 @@ app.post("/api/auth/cadastro", async (req, res) => {
       throw authError;
     }
     const firstName = name.trim().split(" ")[0];
-    await supabase.from("users").upsert({ email, name: firstName, full_name: name, role, auth_id: authData.user.id, is_pro: false }, { onConflict: "email" });
+    // NÃO grava em "users" — tabela morta, sem relação nenhuma com o resto
+    // do app (achado 2026-08-26 auditando rotas não-admin). O front já faz
+    // o upsert real em "usuarios" logo depois de receber esta resposta (ver
+    // App.jsx handleLoginComplete/finishLogin, isNewAccount), com o payload
+    // completo e correto — duplicar essa escrita aqui, numa tabela
+    // diferente, só criava dado morto sem nenhum consumidor.
     // Loga o usuário recém-criado pra já sair com sessão real do Supabase Auth
     // (mesmo token/refresh_token que /api/auth/login devolve) — sem isso o
     // front tinha que fazer uma segunda chamada de login logo em seguida.
@@ -746,9 +751,18 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { data, error } = await supabaseAuthOnly().auth.signInWithPassword({ email, password });
     if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
-    const { data: profile } = await supabase.from("users").select("*").eq("email", email).maybeSingle();
+    // "usuarios" é a tabela real (achado 2026-08-26: isto lia de "users",
+    // tabela morta — sempre voltava profile=null, então "role" aqui sempre
+    // caía em "client"). O front já releva isso com uma releitura própria
+    // de "usuarios" logo após o login (ver App.jsx, comentário no
+    // handleLoginComplete datado 2026-08-15 sobre esse mesmo bug), então na
+    // prática isso só afetava o fallback usado quando essa releitura falha
+    // — mas o fallback devia refletir o role real mesmo assim. "isPro" não
+    // existe em "usuarios" (o app decide isso via "assinaturas", não por
+    // aqui) — mantido como false só pra não quebrar o formato da resposta.
+    const { data: profile } = await supabase.from("usuarios").select("name, role").eq("email", email).maybeSingle();
     log("LOGIN", { email });
-    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: profile?.is_pro || false } });
+    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: profile?.role || "client", isPro: false } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
