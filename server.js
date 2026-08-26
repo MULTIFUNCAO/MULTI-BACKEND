@@ -760,15 +760,24 @@ app.post("/api/auth/login", async (req, res) => {
     // — mas o fallback devia refletir o role real mesmo assim. "isPro" não
     // existe em "usuarios" (o app decide isso via "assinaturas", não por
     // aqui) — mantido como false só pra não quebrar o formato da resposta.
-    const { data: profile } = await supabase.from("usuarios").select("name, role, approved").eq("email", email).maybeSingle();
+    const { data: profile } = await supabase.from("usuarios").select("id, name, role, approved").eq("email", email).maybeSingle();
     // profile.role pode estar preso em "client" mesmo pra conta aprovada
     // (mesmo bug do item 1 em /api/moedas/gerar-pix — approve-professional
     // que não gravou role de verdade, casos Fábio/Junior/Adilson). Sem essa
     // conferência o fallback devolvia "client" pra um profissional de
     // verdade sempre que a releitura do front falhasse.
     const roleFallback = profile?.role || (profile?.approved ? "professional" : "client");
+    // "id" aqui sempre foi auth.users.id (o id da sessão do Supabase Auth),
+    // nunca usuarios.id — e o resto do backend nunca faz join de "usuarios"
+    // por id, só por email (por isso esse descompasso nunca vira bug NESTE
+    // arquivo). Mas a memória do projeto já registrou usuarios.id órfão/
+    // divergente em casos reais (migração de categorias, customer_id do
+    // Junior), então quem consumir esse "id" pra buscar em "usuarios" direto
+    // pode ficar sem achar nada, sem erro nenhum. usuarios_id abaixo é o
+    // valor real da tabela — aditivo, não troca "id" pra não quebrar quem já
+    // lê a resposta hoje.
     log("LOGIN", { email });
-    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, name: profile?.name || email.split("@")[0], email, role: roleFallback, isPro: false } });
+    res.json({ ok: true, token: data.session.access_token, refresh_token: data.session.refresh_token, user: { id: data.user.id, usuarios_id: profile?.id || null, name: profile?.name || email.split("@")[0], email, role: roleFallback, isPro: false } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
