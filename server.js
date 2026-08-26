@@ -1655,10 +1655,19 @@ app.post("/api/moedas/gerar-pix", async (req, res) => {
     // Bloqueio aqui é o que realmente impede a cobrança de acontecer — o
     // gate no front (permiteComprarMoedas) evita mostrar a opção, mas
     // qualquer um batendo direto nesse endpoint pulava ele.
+    //
+    // role='professional' sozinho deixa de fora quem foi aprovado mas teve o
+    // passo final que grava role interrompido (mesmo bug documentado em
+    // /api/admin/professionals, achado 2026-08-20, casos Fábio/Junior/
+    // Adilson: approved=true sem role='professional' nunca ter sido
+    // gravado) — essa conta é um profissional de verdade, só ficava presa em
+    // role='client' e caía nesse 403 à toa. approved=true é o gate real (ver
+    // comentário em /api/admin/approve-professional), então cobre esse caso
+    // sem afiar a regra pra quem nunca foi aprovado.
     const { data: usuario, error: usuarioErr } = await supabase
-      .from("usuarios").select("role").eq("email", email).maybeSingle();
+      .from("usuarios").select("role, approved").eq("email", email).maybeSingle();
     if (usuarioErr) throw usuarioErr;
-    if (!usuario || usuario.role !== "professional")
+    if (!usuario || (usuario.role !== "professional" && usuario.approved !== true))
       return res.status(403).json({ error: "somente_profissional" });
 
     const pacotes = await getPacotesMoedas();
