@@ -1233,6 +1233,12 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
     asaas_subscription_id: subscriptionId || null,
     cupom_codigo: cupomCodigo || null,
     cortesia: !!cortesia,
+    // Zera o marcador de lembrete a cada (re)ativação — sem isso, uma
+    // renovação via Pix ficaria com lembrete_pix_enviado_em ainda setado do
+    // ciclo anterior, e o cron (/api/cron/lembretes) nunca mandaria o
+    // e-mail de aviso do PRÓXIMO vencimento (ver taxa de acesso via Pix,
+    // 2026-08-27).
+    lembrete_pix_enviado_em: null,
   }, { onConflict: "titular_tipo,titular_email" });
   if (error) throw error;
   return { proximaCobranca };
@@ -1443,12 +1449,6 @@ app.post("/api/assinatura/gerar-pix", async (req, res) => {
   const planoEhDeEmpresaPix = plano === "empresa" || plano === "empresa_plus";
   if (planoEhDeEmpresaPix !== (titularTipo === "empresa"))
     return res.status(400).json({ error: "Plano não corresponde ao tipo de titular" });
-  // Taxa de acesso (Promoção de Inauguração, 2026-08-26): decisão explícita
-  // de lançar só com cartão — o front já esconde o toggle Pix pra esse
-  // plano (ver PagamentoPlanoScreen), mas não confia só nisso pra um
-  // endpoint de cobrança; barra aqui também.
-  if (plano === "acesso")
-    return res.status(400).json({ error: "Taxa de acesso ainda não aceita Pix — use cartão de crédito" });
   if (!titularEmail || !cpf)
     return res.status(400).json({ error: "Dados incompletos" });
 
@@ -3162,6 +3162,66 @@ app.post("/api/cron/lembretes", async (req, res) => {
       }
     } catch (e) {
       resumo.erros.push({ geral: "proposta_pendente", erro: e.message });
+    }
+
+    // ── Renovação Pix da Taxa de Acesso (2026-08-27, ver
+    // multi_modelo_comissao_pagamento_intermediado na memória) ──────────────
+    // Cartão renova sozinho via assinatura recorrente da Asaas (webhook
+    // PAYMENT_CONFIRMED). Pix não tem recorrência automática — aqui é o
+    // único lugar que fecha esse ciclo pro plano "acesso". Identifica quem
+    // pagou por Pix (não por cartão) puramente pelos campos que já existem:
+    // asaas_subscription_id nulo = nunca foi uma assinatura recorrente da
+    // Asaas, então só pode ter sido Pix avulso (asaas_payment_id preenchido)
+    // — sem precisar de coluna nova pra guardar o método.
+    try {
+      const agoraMs = Date.now();
+      const emTresDias = new Date(agoraMs + 3 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: assinaturasAcesso, error: errAcesso } = await supabase
+        .from("assinaturas")
+        .select("titular_email,status,proxima_cobranca,lembrete_pix_enviado_em")
+        .eq("titular_tipo", "usuario").eq("plano", "acesso")
+        .is("asaas_subscription_id", null)
+        .in("status", ["ativa", "trial"])
+        .not("proxima_cobranca", "is", null)
+        .lte("proxima_cobranca", emTresDias);
+      if (errAcesso) throw errAcesso;
+
+      for (const a of (assinaturasAcesso || [])) {
+        resumo.processados++;
+        const vencimento = new Date(a.proxima_cobranca).getTime();
+        try {
+          if (vencimento <= agoraMs) {
+            // Venceu de verdade — marca inadimplente. isPro (App.jsx,
+            // carregarPlano) só considera status "trial"/"ativa", então
+            // isso já basta pra tirar o profissional do mural/benefícios
+            // na hora, sem precisar de nenhum filtro novo no front.
+            await supabase.from("assinaturas").update({ status: "inadimplente" })
+              .eq("titular_tipo", "usuario").eq("titular_email", a.titular_email).eq("plano", "acesso");
+            console.log(`[LEMBRETES] taxa_acesso_pix — ${a.titular_email} — marcado inadimplente`);
+          } else if (!a.lembrete_pix_enviado_em) {
+            // Ainda dentro dos 3 dias antes do vencimento, primeiro aviso
+            // desse ciclo — manda e-mail e marca pra não repetir amanhã.
+            const dataVencStr = new Date(a.proxima_cobranca).toLocaleDateString("pt-BR");
+            await mailer.send({
+              to: a.titular_email, from: FROM,
+              subject: "Sua Taxa de Acesso Multi vence em breve",
+              html: layout(`
+                <h2 style="color:#1a1a2e;margin:0 0 8px">Sua taxa de acesso vence em breve</h2>
+                <p style="color:#555;line-height:1.7">Sua Taxa de Acesso Multi (R$ 9,90) vence em <strong>${dataVencStr}</strong>. Como o pagamento foi por Pix, a renovação não é automática — gere um novo Pix no app antes do vencimento pra continuar visível no mural.</p>
+                <a href="${APP_URL}" style="display:inline-block;background:linear-gradient(135deg,#FF6B35,#E64A19);color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700">Renovar agora →</a>
+              `),
+            });
+            await supabase.from("assinaturas").update({ lembrete_pix_enviado_em: new Date().toISOString() })
+              .eq("titular_tipo", "usuario").eq("titular_email", a.titular_email).eq("plano", "acesso");
+            resumo.notificados++;
+            console.log(`[LEMBRETES] taxa_acesso_pix — ${a.titular_email} — e-mail de lembrete enviado`);
+          }
+        } catch (e) {
+          resumo.erros.push({ titular_email: a.titular_email, erro: e.message });
+        }
+      }
+    } catch (e) {
+      resumo.erros.push({ geral: "taxa_acesso_pix", erro: e.message });
     }
 
     res.json(resumo);
