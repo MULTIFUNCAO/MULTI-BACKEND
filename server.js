@@ -1115,6 +1115,18 @@ const PLANOS_ASSINATURA = {
   // no front, confirmado ao vivo antes de reativar).
   empresa:      { valor: 149.90, label: "Multi Empresa" },
   empresa_plus: { valor: 299.90, label: "Multi Empresa Plus" },
+  // "Promoção de Inauguração" (2026-08-26): taxa de acesso obrigatória pro
+  // profissional NOVO no modelo de comissão (não grandfathered) — substitui
+  // temporariamente o cadastro 100% grátis que valia desde 20/08 enquanto o
+  // resto do modelo de comissão de 15% (ver
+  // [[multi_modelo_comissao_pagamento_intermediado]]) não está pronto. Cobrada
+  // no MESMO endpoint/fluxo dos planos pagos (POST /subscriptions Asaas,
+  // cartão, MONTHLY) — só titularTipo "usuario" faz sentido aqui, nunca
+  // "empresa" (fora do escopo dessa entrega). Card dedicado e obrigatório no
+  // front (EscolherPlanoScreen, prop taxaAcessoObrigatoria), não aparece na
+  // lista normal de planos (PLANOS_USUARIO) pra não vazar pro fluxo de
+  // upgrade/"Escolher plano" de quem já é profissional ativo.
+  acesso:       { valor: 9.90,   label: "Multi — Taxa de Acesso" },
 };
 
 // Limites de negócio (categoria/valor/quantidade) por plano do profissional.
@@ -1133,6 +1145,11 @@ const PLANO_LIMITES_USUARIO = {
   autonomo: { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 5000 },
   pro:      { maxCategorias: 3, maxServicosMes: 10, valorMaxServico: 5000 },
   premium:  { maxCategorias: null, maxServicosMes: null, valorMaxServico: null },
+  // Mesmos limites do Autônomo por enquanto — placeholder até o modelo de
+  // comissão (Fase 3+) definir limites próprios pra quem paga só a taxa de
+  // acesso; evita lookup undefined nos pontos que fazem
+  // PLANO_LIMITES_USUARIO[plano] sem fallback.
+  acesso:   { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 5000 },
 };
 // Lê os limites reais de "configuracoes_planos" (fonte única de verdade,
 // compartilhada com o front) em vez do objeto hardcoded acima, que agora só
@@ -1426,6 +1443,12 @@ app.post("/api/assinatura/gerar-pix", async (req, res) => {
   const planoEhDeEmpresaPix = plano === "empresa" || plano === "empresa_plus";
   if (planoEhDeEmpresaPix !== (titularTipo === "empresa"))
     return res.status(400).json({ error: "Plano não corresponde ao tipo de titular" });
+  // Taxa de acesso (Promoção de Inauguração, 2026-08-26): decisão explícita
+  // de lançar só com cartão — o front já esconde o toggle Pix pra esse
+  // plano (ver PagamentoPlanoScreen), mas não confia só nisso pra um
+  // endpoint de cobrança; barra aqui também.
+  if (plano === "acesso")
+    return res.status(400).json({ error: "Taxa de acesso ainda não aceita Pix — use cartão de crédito" });
   if (!titularEmail || !cpf)
     return res.status(400).json({ error: "Dados incompletos" });
 
