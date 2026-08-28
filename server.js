@@ -1040,6 +1040,41 @@ app.post("/api/webhook-asaas", async (req, res) => {
     }
   }
 
+  // Assinatura paga via Pix avulso (autônomo/pro/premium/empresa/empresa_plus
+  // OU a taxa de acesso — qualquer plano de PLANOS_ASSINATURA) — nunca tem
+  // payment.subscription (isso só existe pra renovação recorrente de cartão,
+  // ver bloco lá em cima), reconhecida pelo externalReference
+  // "plano:<titularTipo>:<titularEmail>:<plano>" gravado em
+  // /api/assinatura/gerar-pix. Fallback pro caso do client fechar o app antes
+  // do polling de /api/assinatura/confirmar-pix detectar o pagamento — mesmo
+  // gap que já tinha sido identificado e corrigido pra compra de moeda (bloco
+  // acima) mas nunca replicado aqui até 2026-08-28, achado ao investigar por
+  // que um teste manual de Pix só ativou depois de chamar confirmar-pix na
+  // mão (nada aqui teria feito isso sozinho antes desta correção). Sem cupom
+  // (cortesia) nunca chega aqui — esse caminho responde antes de criar
+  // qualquer payment na Asaas, então não existe conflito com essa checagem.
+  // ativarAssinatura() faz upsert (onConflict titular_tipo,titular_email),
+  // então não corre risco de ativar em dobro se o polling do front também
+  // chamar confirmar-pix depois — mesma garantia de idempotência do bloco de
+  // moedas acima.
+  if ((event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") && typeof payment?.externalReference === "string" && payment.externalReference.startsWith("plano:")) {
+    try {
+      const [, titularTipo, titularEmail, plano] = payment.externalReference.split(":");
+      const planoInfo = PLANOS_ASSINATURA[plano];
+      if (!planoInfo) {
+        console.warn("[WEBHOOK] Assinatura via Pix com plano desconhecido:", payment.externalReference);
+      } else {
+        await ativarAssinatura({
+          titularTipo, titularEmail, plano,
+          paymentId: payment.id, customerId: payment.customer, subscriptionId: null,
+        });
+        console.log("[WEBHOOK] Assinatura via Pix confirmada (fallback):", titularEmail, plano, payment.id);
+      }
+    } catch (e) {
+      console.error("[WEBHOOK] Erro ao processar assinatura via Pix:", e.message || e);
+    }
+  }
+
   res.sendStatus(200);
 });
 
