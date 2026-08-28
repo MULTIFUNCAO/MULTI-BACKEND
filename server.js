@@ -475,7 +475,8 @@ app.get("/api/status-pagamento/:id", async (req, res) => {
       value:  data.value,
     });
   } catch (e) {
-    res.status(500).json({ error: "Erro ao verificar pagamento" });
+    log("ERRO status-pagamento", { id: req.params.id, env: process.env.ASAAS_ENV || "sandbox", detail: e.response?.data || e.message });
+    res.status(500).json({ error: "Erro ao verificar pagamento", detail: e.response?.data || e.message });
   }
 });
 
