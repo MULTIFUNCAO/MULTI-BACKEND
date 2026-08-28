@@ -1343,6 +1343,43 @@ app.post("/api/assinatura/validar-cupom", async (req, res) => {
   }
 });
 
+// Marca a pendência da Taxa de Acesso ANTES de qualquer pagamento — chamado
+// pelo front assim que EscolherPlanoScreen monta com taxaAcessoObrigatoria
+// (cadastro de profissional novo e "Vire Profissional", os dois únicos call
+// sites). Achado 2026-08-28 (ver multi_taxa_acesso_bypass_nova_aba na
+// memória): sem isso, não existia NENHUM registro persistido de que essa
+// conta devia a taxa — o único "gate" era a ordem das telas dentro da aba do
+// cadastro (estado em memória do RegisterScreen), e como o token de sessão já
+// é salvo no localStorage antes do pagamento (ver /api/auth/cadastro), uma
+// segunda aba/reload não tinha como saber disso e caía direto na Home. Com
+// esta linha "pendente" em "assinaturas", o gate real no App() (checando
+// plano/status vindos do banco, não estado de tela) passa a valer em
+// qualquer aba.
+// Nunca sobrescreve uma assinatura já "ativa"/"trial" — cobre tanto quem já
+// pagou e só reabriu esta tela (upgrade/renovação, mesmo componente) quanto
+// quem tem plano pago de verdade (pro/premium) e nunca deveria virar "acesso".
+app.post("/api/assinatura/marcar-pendente", async (req, res) => {
+  const { titularTipo, titularEmail, plano } = req.body || {};
+  if (titularTipo !== "usuario" || !titularEmail || plano !== "acesso")
+    return res.status(400).json({ error: "titularTipo 'usuario', titularEmail e plano 'acesso' são obrigatórios" });
+  try {
+    const { data: existente, error: errSelect } = await supabase
+      .from("assinaturas").select("status")
+      .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail).maybeSingle();
+    if (errSelect) throw errSelect;
+    if (existente && (existente.status === "ativa" || existente.status === "trial"))
+      return res.json({ ok: true, jaAtiva: true });
+    const { error } = await supabase.from("assinaturas").upsert({
+      titular_tipo: titularTipo, titular_email: titularEmail, plano, status: "pendente",
+    }, { onConflict: "titular_tipo,titular_email" });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    log("ERRO assinatura/marcar-pendente", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao marcar pendência" });
+  }
+});
+
 app.post("/api/assinatura/cobrar", async (req, res) => {
   const {
     titularTipo, titularEmail, titularNome, plano, cupom,
