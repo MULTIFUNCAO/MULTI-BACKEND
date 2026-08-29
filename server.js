@@ -2057,6 +2057,9 @@ app.get('/api/admin/pedidos-hoje', async (req, res) => {
     const { data } = await supabase
       .from('pedidos')
       .select('*')
+      // sem uso no front hoje (2026-08-29, ver multi_dados_ficticios_plano),
+      // mas exclui 'demo' por precaução — não é solicitação real do dia.
+      .neq('origem', 'demo')
       .gte('created_at', hoje.toISOString())
       .order('created_at', { ascending: false });
     res.json(data || []);
@@ -2068,10 +2071,13 @@ app.get('/api/admin/receita', async (req, res) => {
   try {
     // Não existe (ainda) um status "completed"/"concluido" nos pedidos reais —
     // ver GET /api/admin/financial para a agregação que o painel usa hoje.
+    // .neq('origem','demo') por precaução (pedido fictício nunca chega em
+    // 'completed' de qualquer forma, mas não custa ser explícito).
     const { data } = await supabase
       .from('pedidos')
       .select('*')
       .eq('status', 'completed')
+      .neq('origem', 'demo')
       .order('created_at', { ascending: false });
     res.json(data || []);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -2183,7 +2189,8 @@ app.get('/api/admin/categorias', async (req, res) => {
   try {
     const { data: pedidos, error } = await supabase
       .from('pedidos')
-      .select('id,categoria,status');
+      .select('id,categoria,status')
+      .neq('origem', 'demo'); // pedido fictício não deve inflar métrica de categoria
     if (error) return res.status(500).json({ error: error.message });
 
     const pedidoIds = (pedidos || []).map(p => p.id);
@@ -2235,7 +2242,8 @@ app.get('/api/admin/oportunidades', async (req, res) => {
   try {
     const { data: pedidos, error } = await supabase
       .from('pedidos')
-      .select('id,cliente_id,cliente_nome,categoria,valor,status,created_at');
+      .select('id,cliente_id,cliente_nome,categoria,valor,status,created_at')
+      .neq('origem', 'demo'); // pedido fictício nunca recebe proposta real — contaria como "sem_proposta" pra sempre
     if (error) return res.status(500).json({ error: error.message });
 
     const abertoIds = (pedidos || []).filter(p => p.status === 'aberto').map(p => p.id);
@@ -2335,7 +2343,8 @@ app.get('/api/admin/funil', async (req, res) => {
   try {
     const { data: pedidos, error } = await supabase
       .from('pedidos')
-      .select('status,created_at,aceite_formal_cliente_em,aceite_formal_profissional_em,concluido_em');
+      .select('status,created_at,aceite_formal_cliente_em,aceite_formal_profissional_em,concluido_em')
+      .neq('origem', 'demo'); // pedido fictício ficaria parado em "aberto" pra sempre, distorcendo o funil
     if (error) return res.status(500).json({ error: error.message });
 
     const STATUS_LABELS = {
@@ -2385,7 +2394,9 @@ app.get('/api/admin/relatorio', async (req, res) => {
 
     const [{ data: usuarios }, { data: pedidos }] = await Promise.all([
       supabase.from('usuarios').select('role,created_at').gte('created_at', inicioAnterior.toISOString()),
-      supabase.from('pedidos').select('status,valor,created_at,concluido_em').gte('created_at', inicioAnterior.toISOString()),
+      // pedido fictício não é solicitação real — excluído pra não inflar
+      // "solicitações" do período no relatório.
+      supabase.from('pedidos').select('status,valor,created_at,concluido_em').gte('created_at', inicioAnterior.toISOString()).neq('origem', 'demo'),
     ]);
 
     const emPeriodo = (iso, desde, ate) => iso && new Date(iso) >= desde && new Date(iso) < ate;
@@ -2948,7 +2959,11 @@ app.get('/api/admin/services', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('pedidos')
-      .select('id,status,categoria,descricao,valor,cliente_id,cliente_nome,profissional_aceito,profissional_nome,cidade,cep,created_at')
+      // origem incluído aqui (não excluído) de propósito — pedido fictício
+      // deve aparecer nesta lista geral também, só que marcado (o front usa
+      // "origem" pra desenhar o badge "FICT"), ver plano em
+      // multi_dados_ficticios_plano na memória.
+      .select('id,status,categoria,descricao,valor,cliente_id,cliente_nome,profissional_aceito,profissional_nome,cidade,cep,created_at,origem')
       .order('created_at', { ascending: false })
       .limit(500);
     if (error) return res.status(500).json({ error: error.message });
@@ -2962,11 +2977,99 @@ app.get('/api/admin/services', async (req, res) => {
       city: p.cidade,
       value: p.valor,
       created_at: p.created_at,
+      origem: p.origem || 'real',
     }));
     res.json({ services });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── ADMIN — DADOS FICTÍCIOS (pedidos "demo") ──────────────────────────────
+// Plano aprovado 2026-08-27 (ver memória multi_dados_ficticios_plano):
+// pedidos fictícios pra preencher o mural do profissional em
+// cidade/categoria nova sem demanda real ainda. Só o Admin cria/edita —
+// nunca o fluxo normal do cliente (PostServiceScreen sempre grava
+// origem='real' por não mandar o campo, que cai no default do banco).
+// Sem DELETE de propósito: "pausar" (demo_ativo=false) em vez de apagar,
+// mesmo padrão adotado depois do histórico de bug de durabilidade em
+// DELETE nesse projeto Supabase.
+const FICTICIO_CAMPOS_EDITAVEIS = ['categoria', 'descricao', 'valor', 'tipo_valor', 'cidade', 'cliente_nome', 'publico_alvo', 'tipo_atendimento', 'prazo'];
+// pedidos.cliente_id é NOT NULL (achado 2026-08-29 testando o INSERT de
+// verdade — o smoke-test anterior era só esbuild/node --check, nunca uma
+// escrita real no banco) e não faz parte dos campos editáveis do Admin —
+// pedido fictício não tem cliente de verdade. Sentinela fixa, nunca igual
+// ao email de nenhum usuário real, então os joins `.in('cliente_id', emails)`
+// em /api/admin/clientes e /api/admin/empresas continuam batendo só com
+// pedido real (mesma lógica pra profissional_aceito, que fica null mesmo).
+const FICTICIO_CLIENTE_ID = 'ficticio-sistema@multifuncao.com.br';
+
+app.get('/api/admin/pedidos-ficticios', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase
+      .from('pedidos')
+      .select('*')
+      .eq('origem', 'demo')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ pedidos: data || [] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/pedidos-ficticios', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const body = req.body || {};
+    if (!body.categoria) return res.status(400).json({ error: 'categoria é obrigatória' });
+    const payload = { origem: 'demo', demo_ativo: true, status: 'aberto', cliente_id: FICTICIO_CLIENTE_ID };
+    FICTICIO_CAMPOS_EDITAVEIS.forEach(campo => { if (body[campo] !== undefined) payload[campo] = body[campo]; });
+    const { data, error } = await supabase.from('pedidos').insert(payload).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ pedido: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/pedidos-ficticios/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const body = req.body || {};
+    const updates = {};
+    FICTICIO_CAMPOS_EDITAVEIS.forEach(campo => { if (body[campo] !== undefined) updates[campo] = body[campo]; });
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nada para atualizar' });
+    // .eq('origem','demo') na condição — trava impossível de editar um
+    // pedido real por engano usando essa rota (ex.: id errado colado no front).
+    const { data, error } = await supabase.from('pedidos').update(updates).eq('id', req.params.id).eq('origem', 'demo').select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Pedido fictício não encontrado' });
+    res.json({ pedido: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/pedidos-ficticios/:id/toggle', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: atual, error: errAtual } = await supabase.from('pedidos').select('demo_ativo').eq('id', req.params.id).eq('origem', 'demo').maybeSingle();
+    if (errAtual) return res.status(500).json({ error: errAtual.message });
+    if (!atual) return res.status(404).json({ error: 'Pedido fictício não encontrado' });
+    const { data, error } = await supabase.from('pedidos').update({ demo_ativo: !atual.demo_ativo }).eq('id', req.params.id).eq('origem', 'demo').select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ pedido: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/pedidos-ficticios/:id/duplicate', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: original, error: errOriginal } = await supabase.from('pedidos').select('*').eq('id', req.params.id).eq('origem', 'demo').maybeSingle();
+    if (errOriginal) return res.status(500).json({ error: errOriginal.message });
+    if (!original) return res.status(404).json({ error: 'Pedido fictício não encontrado' });
+    const copia = { origem: 'demo', demo_ativo: true, status: 'aberto', cliente_id: FICTICIO_CLIENTE_ID };
+    FICTICIO_CAMPOS_EDITAVEIS.forEach(campo => { copia[campo] = original[campo]; });
+    const { data, error } = await supabase.from('pedidos').insert(copia).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ pedido: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
@@ -2978,7 +3081,8 @@ app.get('/api/admin/financial', async (req, res) => {
   try {
     const [{ data: ativas }, { data: pedidosAbertos, count: pendingPayments }, { data: despesas }] = await Promise.all([
       supabase.from('assinaturas').select('plano,titular_email,inicio').eq('status', 'ativa'),
-      supabase.from('pedidos').select('id', { count: 'exact', head: true }).eq('status', 'aberto'),
+      // pedido fictício fica sempre "aberto" — excluído pra não inflar pendingPayments.
+      supabase.from('pedidos').select('id', { count: 'exact', head: true }).eq('status', 'aberto').neq('origem', 'demo'),
       supabase.from('despesas').select('valor'),
     ]);
     const activeSubscriptions = ativas?.length || 0;
