@@ -8,6 +8,7 @@ const express  = require("express");
 const axios    = require("axios");
 const cors     = require("cors");
 const crypto   = require("crypto");
+const QRCode   = require("qrcode");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -1664,6 +1665,113 @@ app.post("/api/assinatura/confirmar-pix", async (req, res) => {
   } catch (e) {
     log("ERRO assinatura/confirmar-pix", e.response?.data || e.message || e);
     res.status(500).json({ error: e.response?.data?.message || e.message || "Erro ao confirmar pagamento" });
+  }
+});
+
+// ── PIX ESTÁTICO (FALLBACK EMERGENCIAL, 2026-08-31) ─────────────────────────
+// Mitigação enquanto o chamado aberto com a Asaas não resolve o campo
+// "recebedor.nome" corrompido (CNPJ colado no nome truncado) que está
+// derrubando 100% dos pagamentos Pix dinâmicos da conta em qualquer banco
+// pagador testado. Este caminho gera o BR Code (payload EMV) direto no
+// nosso próprio código, sem passar pela Asaas — usa a chave Pix da conta
+// Nubank PJ direto, sem o JSON assinado que carregava o nome truncado, então
+// não deveria bater nesse bug (a única fonte de verdade do nome do
+// recebedor, pro banco pagador, passa a ser a consulta normal ao DICT do
+// Bacen pela CHAVE, não um campo embutido no payload).
+// SEM confirmação automática — não existe webhook do Nubank aqui, então
+// precisa ser conferido manualmente no extrato e confirmado via
+// /api/admin/ativar-manual (abaixo). Escopo restrito de propósito só ao
+// plano "acesso" (Taxa de Acesso), que é a urgência de hoje — não estender
+// pros outros planos/moedas sem decisão explícita.
+function crc16Pix(payload) {
+  let crc = 0xFFFF;
+  for (let i = 0; i < payload.length; i++) {
+    crc ^= payload.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xFFFF;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, "0");
+}
+function tlvPix(id, value) {
+  return `${id}${String(value.length).padStart(2, "0")}${value}`;
+}
+function montarPixEstatico({ chave, nome, cidade, valor, txid }) {
+  const payloadFormat = tlvPix("00", "01");
+  const pointOfInit = tlvPix("01", "11"); // "11" = estático, pode ser consultado mais de uma vez
+  const merchantAccountInfo = tlvPix("26", tlvPix("00", "br.gov.bcb.pix") + tlvPix("01", chave));
+  const mcc = tlvPix("52", "0000");
+  const moeda = tlvPix("53", "986");
+  const valorField = valor != null ? tlvPix("54", Number(valor).toFixed(2)) : "";
+  const pais = tlvPix("58", "BR");
+  const nomeField = tlvPix("59", nome.slice(0, 25));
+  const cidadeField = tlvPix("60", cidade.slice(0, 15));
+  const addData = tlvPix("62", tlvPix("05", txid.slice(0, 25)));
+  const semCRC = payloadFormat + pointOfInit + merchantAccountInfo + mcc + moeda + valorField + pais + nomeField + cidadeField + addData + "6304";
+  return semCRC + crc16Pix(semCRC);
+}
+
+const CHAVE_PIX_NUBANK_PJ = "+5511952226121";
+
+app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
+  const { titularTipo, titularEmail, titularNome, plano } = req.body || {};
+  // Restrito à Taxa de Acesso de propósito — ver comentário acima. Outros
+  // planos continuam pelo caminho normal (Asaas), que segue quebrado só até
+  // o chamado ser resolvido, mas não expandimos o escopo do fallback sem
+  // necessidade.
+  if (plano !== "acesso") return res.status(400).json({ error: "Fallback manual disponível só para o plano 'acesso' por enquanto" });
+  if (titularTipo !== "usuario" && titularTipo !== "empresa")
+    return res.status(400).json({ error: "titularTipo inválido" });
+  if (!titularEmail) return res.status(400).json({ error: "titularEmail obrigatório" });
+  const planoInfo = PLANOS_ASSINATURA[plano];
+  if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+
+  try {
+    // txid curto e legível pro extrato do Nubank — não precisa ser sigiloso,
+    // só único o bastante pra achar o pagamento certo na conciliação manual.
+    const txid = "ACESSO" + crypto.createHash("sha1").update(titularEmail + Date.now()).digest("hex").slice(0, 12).toUpperCase();
+    const pixCode = montarPixEstatico({
+      chave: CHAVE_PIX_NUBANK_PJ,
+      nome: "MULTI SERVICOS",
+      cidade: "GUARULHOS",
+      valor: planoInfo.valor,
+      txid,
+    });
+    const qrCodeBase64 = (await QRCode.toDataURL(pixCode, { margin: 1, width: 400 })).split(",")[1];
+
+    log("PIX MANUAL GERADO (fallback emergencial)", { titularEmail, plano, txid });
+    res.json({ txid, pixCode, qrCodeBase64, valor: planoInfo.valor, manual: true });
+  } catch (e) {
+    log("ERRO assinatura/gerar-pix-manual", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao gerar Pix manual" });
+  }
+});
+
+// Confirmação manual — só pra uso administrativo (você, conferindo o
+// extrato do Nubank contra o txid mostrado na tela do cliente/no comprovante
+// que ele mandar). Mesma ativarAssinatura() idempotente de sempre; paymentId
+// prefixado "MANUAL-" deixa rastreável nos logs/futura auditoria que essa
+// ativação não passou pela Asaas.
+app.post("/api/admin/ativar-manual", async (req, res) => {
+  if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
+    return res.status(401).json({ error: "Não autorizado" });
+  const { titularTipo, titularEmail, plano, txid, nota } = req.body || {};
+  if (!titularTipo || !titularEmail || !plano)
+    return res.status(400).json({ error: "titularTipo, titularEmail e plano são obrigatórios" });
+  const planoInfo = PLANOS_ASSINATURA[plano];
+  if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
+  try {
+    const { proximaCobranca } = await ativarAssinatura({
+      titularTipo, titularEmail, plano,
+      paymentId: `MANUAL-${txid || Date.now()}`,
+      customerId: null,
+    });
+    log("ASSINATURA ATIVADA MANUALMENTE (admin)", { titularEmail, plano, txid, nota });
+    res.json({ success: true, status: "ativa", proximaCobranca: proximaCobranca.toISOString() });
+  } catch (e) {
+    log("ERRO admin/ativar-manual", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao ativar manualmente" });
   }
 });
 
