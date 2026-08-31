@@ -2963,7 +2963,7 @@ app.get('/api/admin/services', async (req, res) => {
       // deve aparecer nesta lista geral também, só que marcado (o front usa
       // "origem" pra desenhar o badge "FICT"), ver plano em
       // multi_dados_ficticios_plano na memória.
-      .select('id,status,categoria,descricao,valor,cliente_id,cliente_nome,profissional_aceito,profissional_nome,cidade,cep,created_at,origem')
+      .select('id,status,categoria,descricao,valor,cliente_id,cliente_nome,profissional_aceito,profissional_nome,cidade,cep,created_at,origem,codigo_interno,cadastrado_por')
       .order('created_at', { ascending: false })
       .limit(500);
     if (error) return res.status(500).json({ error: error.message });
@@ -2978,6 +2978,8 @@ app.get('/api/admin/services', async (req, res) => {
       value: p.valor,
       created_at: p.created_at,
       origem: p.origem || 'real',
+      codigo_interno: p.codigo_interno || null,
+      cadastrado_por: p.cadastrado_por || null,
     }));
     res.json({ services });
   } catch(e) {
@@ -3068,6 +3070,94 @@ app.post('/api/admin/pedidos-ficticios/:id/duplicate', async (req, res) => {
     FICTICIO_CAMPOS_EDITAVEIS.forEach(campo => { copia[campo] = original[campo]; });
     const { data, error } = await supabase.from('pedidos').insert(copia).select().maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
+    res.json({ pedido: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN - DEMANDAS DE SUPORTE (MULTI-SUP) ─────────────────────
+// Substitui os pedidos fictícios (origem='demo', desativados 2026-08-30 —
+// ver multi_sup_captacao_manual na memória) como estratégia de captação:
+// suporte cadastra em poucos segundos uma demanda REAL, feita ou
+// autorizada pelo cliente por telefone/WhatsApp/e-mail (nunca fictícia —
+// diferente do que 'demo' fazia, essa aqui precisa ter um cliente de
+// verdade por trás). Reaproveita 100% a mesma tabela "pedidos" e as
+// mesmas regras de categoria/localização/distribuição/notificação que um
+// pedido criado pelo cliente no app — a única diferença é origem='suporte'
+// (marca interna, nunca aparece pro profissional: nem SectionFicticios nem
+// o filtro "origem==='demo'" da distribuição tocam nesse valor) e o código
+// interno MULTI-SUP-XXXXXX pra rastreio.
+async function proximoCodigoSuporte() {
+  const { data } = await supabase.from('pedidos')
+    .select('codigo_interno').eq('origem', 'suporte').not('codigo_interno', 'is', null)
+    .order('codigo_interno', { ascending: false }).limit(1).maybeSingle();
+  const ultimoNum = data?.codigo_interno ? (parseInt(data.codigo_interno.replace('MULTI-SUP-', ''), 10) || 0) : 0;
+  return ultimoNum;
+}
+
+app.get('/api/admin/demandas-suporte', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from('pedidos').select('*')
+      .eq('origem', 'suporte').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demandas: data || [] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/demandas-suporte', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const body = req.body || {};
+    const obrigatorios = ['clienteNome', 'categoria', 'descricao', 'cidade', 'cadastradoPor'];
+    const faltando = obrigatorios.filter(c => !body[c] || !String(body[c]).trim());
+    if (faltando.length) return res.status(400).json({ error: 'Campos obrigatórios faltando: ' + faltando.join(', ') });
+
+    // cliente_id é NOT NULL em "pedidos" (mesmo achado que já vale pro
+    // fictício, ver comentário de FICTICIO_CLIENTE_ID acima) — aqui, ao
+    // contrário do fictício, sempre tenta usar um identificador real do
+    // cliente (e-mail ou telefone que o suporte digitou); só cai pro
+    // timestamp sintético se a pessoa não informou nenhum dos dois.
+    const payload = {
+      origem: 'suporte',
+      status: 'aberto',
+      cliente_id: (body.clienteEmail || '').trim() || (body.telefone || '').trim() || ('suporte-' + Date.now()),
+      cliente_nome: body.clienteNome.trim(),
+      telefone_cliente: body.telefone ? String(body.telefone).trim() : null,
+      categoria: body.categoria,
+      descricao: body.descricao.trim(),
+      valor: (body.valor === '' || body.valor == null) ? null : Number(body.valor),
+      cidade: body.cidade.trim(),
+      bairro: body.bairro ? body.bairro.trim() : null,
+      endereco: body.endereco ? body.endereco.trim() : null,
+      tipo_atendimento: body.tipoAtendimento || 'residencial',
+      quando_precisa: body.dataDesejada || null,
+      horario_desejado: body.horarioDesejado || null,
+      cadastrado_por: body.cadastradoPor.trim(),
+    };
+
+    // Retry só em colisão de código único (23505) — extremamente raro (é
+    // sequencial por consulta, não uma sequence de banco), mas cobre a
+    // corrida de dois cadastros simultâneos sem precisar de trigger/sequence
+    // nova. Qualquer outro erro sobe direto, sem retry.
+    let data, error, codigo;
+    for (let tentativa = 0; tentativa < 5; tentativa++) {
+      const ultimoNum = await proximoCodigoSuporte();
+      codigo = 'MULTI-SUP-' + String(ultimoNum + 1 + tentativa).padStart(6, '0');
+      ({ data, error } = await supabase.from('pedidos').insert({ ...payload, codigo_interno: codigo }).select().maybeSingle());
+      if (!error || error.code !== '23505') break;
+    }
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Mesmo aviso que PostServiceScreen (App.jsx) dispara pro cliente
+    // publicando pelo app — best-effort, se o serviço de push estiver fora
+    // do ar a demanda continua criada normalmente, só sem o alerta imediato
+    // (profissional ainda vê pelo mural/realtime).
+    fetch('https://multifuncao.com.br/api/notify-pedido', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ categoria: payload.categoria, descricao: payload.descricao, publicoAlvo: 'geral', cidade: payload.cidade }),
+    }).catch(() => {});
+
+    log('DEMANDA SUPORTE CADASTRADA', { codigo, cadastradoPor: payload.cadastrado_por, categoria: payload.categoria, cidade: payload.cidade });
     res.json({ pedido: data });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
