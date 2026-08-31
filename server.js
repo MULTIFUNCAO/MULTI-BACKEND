@@ -2641,6 +2641,97 @@ app.get('/api/admin/relatorio', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — RELATÓRIOS DETALHADOS (2026-08-31) ───────────────────────────────
+// Dois relatórios pedidos pelo Thiago, agrupáveis por data e categoria:
+//
+// 1) "Profissionais Ativados" — usuarios com role='professional' AND
+//    approved=true. Não existe approved_em/aprovado_em na tabela — usa
+//    created_at como aproximação (avisado explicitamente na resposta,
+//    ver "limitacao_data" — pode não bater com a data real de aprovação
+//    se ela aconteceu bem depois do cadastro). categoria_servico é array:
+//    um profissional com 2 categorias conta 1x em CADA uma (decisão default,
+//    não confirmada com o Thiago — se ele preferir contar só a principal,
+//    é só trocar o .forEach(cats...) abaixo por pegar cats[0]).
+//
+// 2) "Serviços Concluídos" — pedidos com status='concluido' (só vira esse
+//    status quando concluido_cliente_em E concluido_profissional_em estão
+//    preenchidos, ver handleConfirmarConclusao no App.jsx — status='concluido'
+//    já É o sinal de confirmação bilateral, não precisa checar os dois
+//    campos separados). categoria é coluna própria de "pedidos" (não precisa
+//    de join com profissional). Exclui origem='demo' (fictício), mesmo
+//    padrão já usado no resto dos relatórios — origem='suporte' (demandas
+//    reais cadastradas pelo MULTI-SUP) conta normalmente.
+//
+// Agregação em JS (não em SQL) — mesmo padrão já usado em /api/admin/categorias
+// e /api/admin/relatorio: busca as linhas cruas do período e agrupa aqui.
+// Front decide como exibir (por data, por categoria, ou os dois) a partir
+// da mesma lista "linhas" — não precisa de rota nova pra cada visão.
+app.get('/api/admin/relatorio-detalhado', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const dias = Math.max(1, Math.min(365, parseInt(req.query.dias, 10) || 30));
+  try {
+    const agora = new Date();
+    const desde = new Date(agora.getTime() - dias * 86400000);
+
+    const [{ data: profissionais, error: errPro }, { data: pedidos, error: errPed }] = await Promise.all([
+      supabase.from('usuarios')
+        .select('created_at,categoria_servico')
+        .eq('role', 'professional').eq('approved', true)
+        .gte('created_at', desde.toISOString()),
+      supabase.from('pedidos')
+        .select('concluido_em,categoria,valor')
+        .eq('status', 'concluido')
+        .not('concluido_em', 'is', null)
+        .gte('concluido_em', desde.toISOString())
+        .neq('origem', 'demo'),
+    ]);
+    if (errPro) throw errPro;
+    if (errPed) throw errPed;
+
+    const diaChave = iso => iso ? iso.slice(0, 10) : 'sem-data'; // YYYY-MM-DD
+
+    // Relatório 1 — Profissionais Ativados
+    const profissionaisMapa = {}; // "data|categoria" -> quantidade
+    let profissionaisSemCategoria = 0;
+    (profissionais || []).forEach(u => {
+      const dia = diaChave(u.created_at);
+      const cats = Array.isArray(u.categoria_servico) ? u.categoria_servico : [];
+      if (!cats.length) { profissionaisSemCategoria++; return; }
+      cats.forEach(cat => {
+        const chave = `${dia}|${cat}`;
+        profissionaisMapa[chave] = (profissionaisMapa[chave] || 0) + 1;
+      });
+    });
+    const profissionaisLinhas = Object.entries(profissionaisMapa)
+      .map(([chave, quantidade]) => { const [data, categoria] = chave.split('|'); return { data, categoria, quantidade }; })
+      .sort((a, b) => a.data.localeCompare(b.data) || a.categoria.localeCompare(b.categoria));
+
+    // Relatório 2 — Serviços Concluídos
+    const servicosMapa = {}; // "data|categoria" -> { quantidade, valor }
+    (pedidos || []).forEach(p => {
+      const dia = diaChave(p.concluido_em);
+      const cat = p.categoria || 'sem-categoria';
+      const chave = `${dia}|${cat}`;
+      if (!servicosMapa[chave]) servicosMapa[chave] = { quantidade: 0, valor: 0 };
+      servicosMapa[chave].quantidade++;
+      servicosMapa[chave].valor += Number(p.valor) || 0;
+    });
+    const servicosLinhas = Object.entries(servicosMapa)
+      .map(([chave, v]) => { const [data, categoria] = chave.split('|'); return { data, categoria, quantidade: v.quantidade, valor: v.valor }; })
+      .sort((a, b) => a.data.localeCompare(b.data) || a.categoria.localeCompare(b.categoria));
+
+    res.json({
+      periodo_dias: dias,
+      profissionais_ativados: {
+        linhas: profissionaisLinhas,
+        sem_categoria: profissionaisSemCategoria,
+        limitacao_data: "Sem approved_em/aprovado_em na tabela usuarios — data usada é created_at (cadastro), pode não bater com a data real da aprovação.",
+      },
+      servicos_concluidos: { linhas: servicosLinhas },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — CUPONS (mês grátis pra quem divulga a plataforma) ───────────────
 // Ver supabase_cupons_migration.sql / buscarCupomValido() / registrarUsoCupom()
 // acima. Criação e ativação/desativação são as únicas mudanças de cupom que
