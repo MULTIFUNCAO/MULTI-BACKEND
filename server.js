@@ -1254,17 +1254,34 @@ async function buscarOuCriarClienteAsaas({ email, nome, cpf, phone }) {
 // síncrono, dentro do próprio /api/assinatura/cobrar; PIX: assíncrono, só
 // depois que /api/assinatura/confirmar-pix reconfere o status). RLS trava
 // insert/update de "assinaturas" pra service_role (ver comentário acima).
+// "acesso" (Taxa de Acesso) virou entrada única sem renovação — decisão de
+// negócio 31/08/2026, substitui a decisão de 20/08 ("só comissão, sem
+// mensalidade"): agora não é nem mensalidade nem comissão, é só a taxa de
+// entrada, uma vez, pra sempre. Flag (não deleta nada) pra ficar fácil
+// reverter se o modelo mudar de novo depois — mesma filosofia já usada pro
+// código de comissão (nunca chegou a existir de verdade, ver Fase 6 na
+// memória, então não há nada pra desligar ali; aqui SIM existe algo rodando
+// hoje — renovação de cartão via assinatura Asaas e o cron de vencimento do
+// Pix — por isso a flag).
+const RENOVACAO_ACESSO_ATIVA = false;
+
 async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, customerId, subscriptionId, cupomCodigo, cortesia }) {
   const inicio = new Date();
-  const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
+  // Planos que não são "acesso" continuam com ciclo de 30 dias de sempre.
+  // "acesso" só tem proximaCobranca se RENOVACAO_ACESSO_ATIVA for religada —
+  // null aqui vira null em expira_em/proxima_cobranca no banco, que por sua
+  // vez tira essas linhas do radar do cron de lembrete/vencimento (filtro
+  // `.not("proxima_cobranca", "is", null)`) sem precisar mexer no cron.
+  const temRenovacao = plano !== "acesso" || RENOVACAO_ACESSO_ATIVA;
+  const proximaCobranca = temRenovacao ? new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000) : null;
   const { error } = await supabase.from("assinaturas").upsert({
     titular_tipo: titularTipo,
     titular_email: titularEmail,
     plano,
     status: "ativa",
     inicio: inicio.toISOString(),
-    expira_em: proximaCobranca.toISOString(),
-    proxima_cobranca: proximaCobranca.toISOString(),
+    expira_em: proximaCobranca ? proximaCobranca.toISOString() : null,
+    proxima_cobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
     asaas_customer_id: customerId,
     asaas_payment_id: paymentId,
     asaas_subscription_id: subscriptionId || null,
@@ -1424,6 +1441,43 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
 
     const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
 
+    // "acesso" (Taxa de Acesso) virou cobrança ÚNICA por cartão também —
+    // decisão de negócio 31/08/2026 (RENOVACAO_ACESSO_ATIVA acima). Antes
+    // disso este endpoint criava uma ASSINATURA (POST /subscriptions,
+    // cycle MONTHLY) pra QUALQUER plano, "acesso" incluído — a Asaas cobraria
+    // o cartão de novo sozinha todo mês, pra sempre. Ramo separado, cedo, pra
+    // não passar nem perto do código de assinatura recorrente logo abaixo
+    // (que continua valendo pra autônomo/pro/premium/empresa/empresa_plus,
+    // intocado). Cupom não se aplica aqui (já bloqueado mais acima, só vale
+    // pro Multi Autônomo).
+    if (plano === "acesso") {
+      const pay = await asaas.post("/payments", {
+        customer: customerId, billingType: "CREDIT_CARD", value: planoInfo.valor,
+        dueDate: new Date().toISOString().split("T")[0],
+        creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
+        creditCardHolderInfo: {
+          name: cardHolder, email: titularEmail, cpfCnpj: cpf,
+          phone: (phone || "").replace(/\D/g, "") || undefined,
+          postalCode: "01310100", addressNumber: "1",
+        },
+        description: `${planoInfo.label} — pagamento único`,
+      });
+      if (!["CONFIRMED", "RECEIVED"].includes(pay.data.status)) {
+        log("TAXA DE ACESSO COBRANCA PENDENTE (cartão)", { titularEmail, status: pay.data.status, paymentId: pay.data.id });
+        return res.status(402).json({ error: "Pagamento não confirmado", status: pay.data.status });
+      }
+      const { proximaCobranca } = await ativarAssinatura({
+        titularTipo, titularEmail, plano, paymentId: pay.data.id, customerId,
+        subscriptionId: null, // sem assinatura recorrente — cobrança única
+      });
+      log("TAXA DE ACESSO ATIVADA (cartão, cobrança única)", { titularEmail, paymentId: pay.data.id });
+      return res.json({
+        success: true, status: "ativa", cortesia: false, valor: planoInfo.valor,
+        proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
+        subscriptionId: null,
+      });
+    }
+
     // A cobrança agora cria uma ASSINATURA de verdade na Asaas (POST
     // /subscriptions), não um pagamento avulso (POST /payments) como era
     // antes — é a própria Asaas quem cobra o mês 2, 3, 4... sozinha, no
@@ -1485,7 +1539,7 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
       status: "ativa",
       cortesia: !!cupomValidado,
       valor: planoInfo.valor,
-      proximaCobranca: proximaCobranca.toISOString(),
+      proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
       subscriptionId: sub.data.id,
     });
   } catch (e) {
@@ -1559,7 +1613,7 @@ app.post("/api/assinatura/gerar-pix", async (req, res) => {
         status: "ativa",
         customerId,
         valor: planoInfo.valor,
-        proximaCobranca: proximaCobranca.toISOString(),
+        proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
       });
     }
 
@@ -1617,7 +1671,7 @@ app.post("/api/assinatura/confirmar-pix", async (req, res) => {
       success: true,
       status: "ativa",
       valor: planoInfo.valor,
-      proximaCobranca: proximaCobranca.toISOString(),
+      proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
       paymentId,
     });
   } catch (e) {
@@ -1775,7 +1829,7 @@ app.post("/api/admin/ativar-manual", async (req, res) => {
     // um dia alguém reabrir essa assinatura como "pendente" de novo).
     await supabase.from("assinaturas").update({ pix_manual_txid: null }).eq("titular_tipo", titularTipo).eq("titular_email", titularEmail);
     log("ASSINATURA ATIVADA MANUALMENTE (admin)", { titularEmail, plano, txid, nota });
-    res.json({ success: true, status: "ativa", proximaCobranca: proximaCobranca.toISOString() });
+    res.json({ success: true, status: "ativa", proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null });
   } catch (e) {
     log("ERRO admin/ativar-manual", e.message || e);
     res.status(500).json({ error: e.message || "Erro ao ativar manualmente" });
@@ -3597,6 +3651,18 @@ app.post("/api/cron/lembretes", async (req, res) => {
     // asaas_subscription_id nulo = nunca foi uma assinatura recorrente da
     // Asaas, então só pode ter sido Pix avulso (asaas_payment_id preenchido)
     // — sem precisar de coluna nova pra guardar o método.
+    //
+    // DESLIGADO (31/08/2026, RENOVACAO_ACESSO_ATIVA=false): "acesso" virou
+    // entrada única sem vencimento — ativarAssinatura() já grava
+    // proxima_cobranca=null pra esse plano, então o filtro
+    // .not("proxima_cobranca","is",null) abaixo já esvazia a lista sozinho
+    // pra ativações novas. Guarda explícita aqui é só reforço/clareza — e
+    // cobre as 28 linhas antigas que ainda tinham proxima_cobranca preenchida
+    // até a migration de limpeza rodar. Não removido: religar é só voltar a
+    // flag pra true.
+    if (!RENOVACAO_ACESSO_ATIVA) {
+      log("LEMBRETES taxa_acesso_pix — pulado (RENOVACAO_ACESSO_ATIVA=false)");
+    } else
     try {
       const agoraMs = Date.now();
       const emTresDias = new Date(agoraMs + 3 * 24 * 60 * 60 * 1000).toISOString();
