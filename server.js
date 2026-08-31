@@ -175,6 +175,30 @@ app.get("/", (req, res) => res.json({
   db: "supabase"
 }));
 
+// DEBUG TEMPORÁRIO (2026-08-31, reaberto) — investigando o caso Ronaldo
+// Rosa (ronaldorosad9@gmail.com, sem linha em usuarios NEM assinaturas —
+// checando se pagou por algum caminho que nem chegou a criar conta aqui).
+// Remover de novo depois.
+app.get("/api/debug/pix-por-email", async (req, res) => {
+  if (req.query.secret !== "debug_pix_31ago_temp")
+    return res.status(401).json({ error: "não autorizado" });
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: "email obrigatório" });
+  try {
+    const cust = await asaas.get(`/customers?email=${encodeURIComponent(email)}`);
+    const clientes = cust.data?.data || [];
+    if (!clientes.length) return res.json({ clientes: [], pagamentos: [] });
+    const resultado = [];
+    for (const c of clientes) {
+      const pays = await asaas.get(`/payments?customer=${c.id}&limit=20`);
+      resultado.push({ customerId: c.id, email: c.email, pagamentos: pays.data?.data || [] });
+    }
+    res.json({ resultado });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // GATILHO 1 — Boas-Vindas
 // ════════════════════════════════════════════════════════════════════════════
