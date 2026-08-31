@@ -176,48 +176,6 @@ app.get("/", (req, res) => res.json({
 }));
 
 // ════════════════════════════════════════════════════════════════════════════
-// DEBUG TEMPORÁRIO (2026-08-31) — investigando QR travado em "Aguardando
-// pagamento" mesmo após pagamento real. Só leitura, direto na Asaas, pra
-// localizar o pagamento de um titular específico sem precisar de acesso ao
-// painel da Asaas nem à EMAIL_ADMIN_KEY (nenhuma das duas disponível na
-// sessão que está investigando). REMOVER assim que o caso for resolvido.
-// ════════════════════════════════════════════════════════════════════════════
-app.get("/api/debug/pix-por-email", async (req, res) => {
-  if (req.query.secret !== "debug_pix_31ago_temp")
-    return res.status(401).json({ error: "não autorizado" });
-  const email = req.query.email;
-  if (!email) return res.status(400).json({ error: "email obrigatório" });
-  try {
-    const cust = await asaas.get(`/customers?email=${encodeURIComponent(email)}`);
-    const clientes = cust.data?.data || [];
-    if (!clientes.length) return res.json({ clientes: [], pagamentos: [] });
-    const resultado = [];
-    for (const c of clientes) {
-      const pays = await asaas.get(`/payments?customer=${c.id}&limit=20`);
-      resultado.push({ customerId: c.id, email: c.email, pagamentos: pays.data?.data || [] });
-    }
-    res.json({ resultado });
-  } catch (e) {
-    res.status(500).json({ error: e.response?.data || e.message });
-  }
-});
-
-// DEBUG TEMPORÁRIO (2026-08-31) — só leitura, pra ver os dados comerciais
-// atuais da conta Asaas (inclusive o companyName corrompido e as opções
-// válidas em availableCompanyNames) antes de tentar corrigir via POST no
-// mesmo endpoint. REMOVER junto com o de cima.
-app.get("/api/debug/commercial-info", async (req, res) => {
-  if (req.query.secret !== "debug_pix_31ago_temp")
-    return res.status(401).json({ error: "não autorizado" });
-  try {
-    const r = await asaas.get("/myAccount/commercialInfo");
-    res.json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: e.response?.data || e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════════════════════════
 // GATILHO 1 — Boas-Vindas
 // ════════════════════════════════════════════════════════════════════════════
 app.post("/api/email/boas-vindas", async (req, res) => {
@@ -1740,6 +1698,17 @@ app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
     });
     const qrCodeBase64 = (await QRCode.toDataURL(pixCode, { margin: 1, width: 400 })).split(",")[1];
 
+    // Grava o txid na linha "pendente" que /api/assinatura/marcar-pendente já
+    // criou quando a tela de escolha de plano montou (ver comentário lá) —
+    // é isso que a aba "Pix Manual" do admin lista pra conciliação. Plain
+    // UPDATE (não upsert): se a linha "pendente" não existir por algum
+    // motivo, não queremos criar uma do zero aqui e mascarar esse caso —
+    // só não aparece na lista do admin (log abaixo ajuda a notar).
+    const { error: errTxid } = await supabase.from("assinaturas")
+      .update({ pix_manual_txid: txid, pix_manual_gerado_em: new Date().toISOString() })
+      .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail);
+    if (errTxid) log("AVISO gerar-pix-manual: não gravou txid na assinatura pendente", { titularEmail, txid, erro: errTxid.message });
+
     log("PIX MANUAL GERADO (fallback emergencial)", { titularEmail, plano, txid });
     res.json({ txid, pixCode, qrCodeBase64, valor: planoInfo.valor, manual: true });
   } catch (e) {
@@ -1748,14 +1717,48 @@ app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
   }
 });
 
-// Confirmação manual — só pra uso administrativo (você, conferindo o
-// extrato do Nubank contra o txid mostrado na tela do cliente/no comprovante
-// que ele mandar). Mesma ativarAssinatura() idempotente de sempre; paymentId
-// prefixado "MANUAL-" deixa rastreável nos logs/futura auditoria que essa
-// ativação não passou pela Asaas.
+// Lista pra aba "Pix Manual" do admin — linhas de assinaturas ainda
+// pendentes que já geraram um Pix estático (pix_manual_txid preenchido),
+// aguardando conciliação com o extrato do Nubank. Junta com "usuarios" só
+// pra mostrar nome/whatsapp (assinaturas não tem esses campos, só o e-mail).
+app.get("/api/admin/pix-manual-pendentes", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pendentes, error } = await supabase.from("assinaturas")
+      .select("titular_tipo,titular_email,plano,pix_manual_txid,pix_manual_gerado_em")
+      .eq("status", "pendente").not("pix_manual_txid", "is", null)
+      .order("pix_manual_gerado_em", { ascending: false });
+    if (error) throw error;
+    const emails = (pendentes || []).map(p => p.titular_email);
+    const { data: usuarios } = emails.length
+      ? await supabase.from("usuarios").select("email,name,whatsapp").in("email", emails)
+      : { data: [] };
+    const porEmail = Object.fromEntries((usuarios || []).map(u => [u.email, u]));
+    const lista = (pendentes || []).map(p => ({
+      titularTipo: p.titular_tipo,
+      titularEmail: p.titular_email,
+      plano: p.plano,
+      valor: PLANOS_ASSINATURA[p.plano]?.valor ?? null,
+      txid: p.pix_manual_txid,
+      geradoEm: p.pix_manual_gerado_em,
+      nome: porEmail[p.titular_email]?.name || null,
+      whatsapp: porEmail[p.titular_email]?.whatsapp || null,
+    }));
+    res.json({ pendentes: lista });
+  } catch (e) {
+    log("ERRO admin/pix-manual-pendentes", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao listar Pix pendentes" });
+  }
+});
+
+// Confirmação manual — botão "Aprovar" da aba "Pix Manual" no admin (você,
+// já tendo conferido o extrato do Nubank contra o txid). Mesma
+// ativarAssinatura() idempotente de sempre; paymentId prefixado "MANUAL-"
+// deixa rastreável nos logs/futura auditoria que essa ativação não passou
+// pela Asaas. Protegido pelo mesmo login por token de todas as outras abas
+// do admin (checkAdminKey) — não pela EMAIL_ADMIN_KEY antiga/exposta.
 app.post("/api/admin/ativar-manual", async (req, res) => {
-  if (req.headers["x-admin-key"] !== process.env.EMAIL_ADMIN_KEY)
-    return res.status(401).json({ error: "Não autorizado" });
+  if (!checkAdminKey(req, res)) return;
   const { titularTipo, titularEmail, plano, txid, nota } = req.body || {};
   if (!titularTipo || !titularEmail || !plano)
     return res.status(400).json({ error: "titularTipo, titularEmail e plano são obrigatórios" });
@@ -1767,6 +1770,10 @@ app.post("/api/admin/ativar-manual", async (req, res) => {
       paymentId: `MANUAL-${txid || Date.now()}`,
       customerId: null,
     });
+    // Limpa o txid depois de aprovado — cosmético (a linha já sai da lista
+    // de pendentes porque status vira "ativa", isso só evita reaparecer se
+    // um dia alguém reabrir essa assinatura como "pendente" de novo).
+    await supabase.from("assinaturas").update({ pix_manual_txid: null }).eq("titular_tipo", titularTipo).eq("titular_email", titularEmail);
     log("ASSINATURA ATIVADA MANUALMENTE (admin)", { titularEmail, plano, txid, nota });
     res.json({ success: true, status: "ativa", proximaCobranca: proximaCobranca.toISOString() });
   } catch (e) {
