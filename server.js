@@ -175,6 +175,33 @@ app.get("/", (req, res) => res.json({
 }));
 
 // ════════════════════════════════════════════════════════════════════════════
+// DEBUG TEMPORÁRIO (2026-08-31) — investigando QR travado em "Aguardando
+// pagamento" mesmo após pagamento real. Só leitura, direto na Asaas, pra
+// localizar o pagamento de um titular específico sem precisar de acesso ao
+// painel da Asaas nem à EMAIL_ADMIN_KEY (nenhuma das duas disponível na
+// sessão que está investigando). REMOVER assim que o caso for resolvido.
+// ════════════════════════════════════════════════════════════════════════════
+app.get("/api/debug/pix-por-email", async (req, res) => {
+  if (req.query.secret !== "debug_pix_31ago_temp")
+    return res.status(401).json({ error: "não autorizado" });
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: "email obrigatório" });
+  try {
+    const cust = await asaas.get(`/customers?email=${encodeURIComponent(email)}`);
+    const clientes = cust.data?.data || [];
+    if (!clientes.length) return res.json({ clientes: [], pagamentos: [] });
+    const resultado = [];
+    for (const c of clientes) {
+      const pays = await asaas.get(`/payments?customer=${c.id}&limit=20`);
+      resultado.push({ customerId: c.id, email: c.email, pagamentos: pays.data?.data || [] });
+    }
+    res.json({ resultado });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GATILHO 1 — Boas-Vindas
 // ════════════════════════════════════════════════════════════════════════════
 app.post("/api/email/boas-vindas", async (req, res) => {
