@@ -201,6 +201,21 @@ app.get("/api/debug/pix-por-email", async (req, res) => {
   }
 });
 
+// DEBUG TEMPORÁRIO (2026-08-31) — só leitura, pra ver os dados comerciais
+// atuais da conta Asaas (inclusive o companyName corrompido e as opções
+// válidas em availableCompanyNames) antes de tentar corrigir via POST no
+// mesmo endpoint. REMOVER junto com o de cima.
+app.get("/api/debug/commercial-info", async (req, res) => {
+  if (req.query.secret !== "debug_pix_31ago_temp")
+    return res.status(401).json({ error: "não autorizado" });
+  try {
+    const r = await asaas.get("/myAccount/commercialInfo");
+    res.json(r.data);
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // GATILHO 1 — Boas-Vindas
 // ════════════════════════════════════════════════════════════════════════════
