@@ -2252,6 +2252,42 @@ app.get("/api/admin/stats", async (req, res) => {
     const hoje = new Date().toISOString().split("T")[0];
     const novosHoje = usuarios?.filter(u => u.created_at?.startsWith(hoje)) || [];
     const mrr = proAtivos * 29.90;
+
+    // Fase 2 do MULTI-CRM (dashboard), ver memória do projeto. "valorMovimentado"
+    // usa a MESMA definição já usada em /api/admin/clientes e
+    // /api/admin/clientes/:email (soma de "valor" só dos pedidos com
+    // status='concluido') — não inventar um segundo número de "valor
+    // movimentado" divergente pro dashboard. "pedidosFechados" conta
+    // profissional_aceito preenchido (alguém foi escolhido), independente do
+    // status final — é sobre fechar negociação, não sobre concluir serviço.
+    const { data: pedidos } = await supabase
+      .from("pedidos")
+      .select("status,valor,profissional_aceito,created_at")
+      .neq("origem", "demo"); // pedido fictício não é solicitação real, não deve inflar os cards
+    const totalPedidos = (pedidos || []).length;
+    const pedidosFechados = (pedidos || []).filter(p => p.profissional_aceito).length;
+    const valorMovimentado = (pedidos || [])
+      .filter(p => p.status === "concluido")
+      .reduce((s, p) => s + (Number(p.valor) || 0), 0);
+
+    // Série "cadastros de clientes por dia" (últimos 30 dias, incluindo hoje)
+    // pro gráfico de linha do dashboard. Agregado aqui no Node a partir de
+    // "clients" (já buscado acima, só role+created_at) — mesmo padrão já
+    // usado em /api/admin/categorias e /api/admin/funil: só os pontos
+    // já somados vão pro frontend, nunca a linha crua de cada cliente. Se
+    // "usuarios" crescer muito, isso deveria virar uma função agregada no
+    // Postgres em vez de somar em memória aqui.
+    const porDia = {};
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      porDia[d] = 0;
+    }
+    clients.forEach(c => {
+      const dia = c.created_at?.slice(0, 10);
+      if (dia && dia in porDia) porDia[dia]++;
+    });
+    const cadastrosPorDia = Object.entries(porDia).map(([data, count]) => ({ data, count }));
+
     res.json({
       totalUsers: pros.length + clients.length,
       totalPros: pros.length,
@@ -2259,7 +2295,11 @@ app.get("/api/admin/stats", async (req, res) => {
       proAtivos,
       mrr: mrr.toFixed(2),
       novosHoje: novosHoje.length,
-      receitaEstimada: mrr.toFixed(2)
+      receitaEstimada: mrr.toFixed(2),
+      totalPedidos,
+      pedidosFechados,
+      valorMovimentado,
+      cadastrosPorDia,
     });
   } catch(e) {
     res.status(500).json({ error: e.message });
