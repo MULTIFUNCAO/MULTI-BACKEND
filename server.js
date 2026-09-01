@@ -765,9 +765,16 @@ app.post("/api/auth/cadastro", async (req, res) => {
 
 // AUTH — Login
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  let { email, password } = req.body;
   if (!email || !password)
     return res.status(400).json({ error: "email e password são obrigatórios" });
+  // Normaliza pra minúsculo — achado 2026-09-01 (caso Anderson/
+  // karinegatinhadomc): a releitura de "usuarios" logo abaixo faz
+  // .eq("email", email), sensível a maiúscula/minúscula, sem normalização
+  // nenhuma. signInWithPassword não liga pra isso (Supabase Auth já
+  // normaliza internamente), mas essa query aqui sim — mesmo fix aplicado
+  // no front (App.jsx, handleLoginComplete).
+  email = (email || "").trim().toLowerCase();
   try {
     const { data, error } = await supabaseAuthOnly().auth.signInWithPassword({ email, password });
     if (error) return res.status(401).json({ error: "Email ou senha incorretos" });
