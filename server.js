@@ -2367,16 +2367,21 @@ app.get('/api/admin/receita', async (req, res) => {
 app.get('/api/admin/clientes', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { data: clientes, error } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('role', 'client')
-      .order('created_at', { ascending: false });
+    // Fase 3 do Admin/CRM (filtros), ver memória do projeto. "cidade" filtra
+    // direto na query do Supabase (coluna simples, reduz o que sai do banco).
+    // "categoria" e "status" são conceitos derivados (categoria vem de
+    // pedidos, status_engajamento é calculado) — filtrados aqui no Node
+    // DEPOIS de agregar, mas ANTES do res.json, então o que sai pro
+    // frontend já é só o resultado filtrado (não manda tudo pra filtrar lá).
+    const { cidade, categoria, status } = req.query;
+    let query = supabase.from('usuarios').select('*').eq('role', 'client');
+    if (cidade) query = query.eq('city', cidade);
+    const { data: clientes, error } = await query.order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
     const emails = (clientes || []).map(c => c.email).filter(Boolean);
     const { data: pedidos } = emails.length
-      ? await supabase.from('pedidos').select('cliente_id,status,valor').in('cliente_id', emails)
+      ? await supabase.from('pedidos').select('cliente_id,status,valor,categoria').in('cliente_id', emails)
       : { data: [] };
     // Propostas recebidas por cliente — pedido pelo novo Admin/CRM (Fase 1,
     // ver memória do projeto). "propostas.cliente_email" já existe e bate
@@ -2386,7 +2391,7 @@ app.get('/api/admin/clientes', async (req, res) => {
       ? await supabase.from('propostas').select('cliente_email').in('cliente_email', emails)
       : { data: [] };
 
-    const result = (clientes || []).map(c => {
+    let result = (clientes || []).map(c => {
       const seus = (pedidos || []).filter(p => p.cliente_id === c.email);
       const concluidos = seus.filter(p => p.status === 'concluido');
       return {
@@ -2401,9 +2406,34 @@ app.get('/api/admin/clientes', async (req, res) => {
         // ou não pedido, como pedido na spec ("ativo / nunca solicitou nada").
         propostas_recebidas: (propostas || []).filter(p => p.cliente_email === c.email).length,
         status_engajamento: seus.length ? 'ativo' : 'sem_solicitacao',
+        categorias: [...new Set(seus.map(p => p.categoria).filter(Boolean))],
       };
     });
+    if (categoria) result = result.filter(c => c.categorias.includes(categoria));
+    if (status) result = result.filter(c => c.status_engajamento === status);
     res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — OPÇÕES DE FILTRO (CLIENTES) ──────────────────────────────────
+// Fase 3 do Admin/CRM. Popula os dropdowns de cidade/categoria da tela de
+// Clientes com valor real do banco — nunca lista fixa no código. Rota
+// própria (não "/api/admin/clientes/:algo") de propósito: evita colidir
+// com a rota de ficha "/api/admin/clientes/:email" logo abaixo.
+app.get('/api/admin/clientes-filtros', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: clientes, error } = await supabase.from('usuarios').select('email,city').eq('role', 'client');
+    if (error) return res.status(500).json({ error: error.message });
+    const cidades = [...new Set((clientes || []).map(c => c.city).filter(Boolean))].sort();
+
+    const emails = (clientes || []).map(c => c.email).filter(Boolean);
+    const { data: pedidos } = emails.length
+      ? await supabase.from('pedidos').select('cliente_id,categoria').in('cliente_id', emails)
+      : { data: [] };
+    const categorias = [...new Set((pedidos || []).map(p => p.categoria).filter(Boolean))].sort();
+
+    res.json({ cidades, categorias });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2954,11 +2984,20 @@ app.get('/api/admin/professionals', async (req, res) => {
     // é setado nesse mesmo passo do cadastro (RegisterScreen/
     // VirarProfissionalScreen em App.jsx), então serve de sinal independente
     // de "entrou no fluxo profissional" mesmo quando role não bateu.
-    const { data: pros, error } = await supabase
+    // Fase 3 do Admin/CRM (filtros), ver memória do projeto. "cidade" e
+    // "categoria" filtram direto na query do Supabase — reduz não só o que
+    // volta pro frontend, mas também os joins de pedidos/avaliacoes/
+    // assinaturas feitos mais abaixo (rodam só pros "emails" já filtrados).
+    // "status" (approved/pendente/role_divergente) é derivado no map lá
+    // embaixo, filtrado no Node antes do res.json.
+    const { cidade, categoria, status } = req.query;
+    let query = supabase
       .from('usuarios')
       .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,role,autonomia_aceita_em,created_at')
-      .or('role.eq.professional,autonomia_aceita_em.not.is.null')
-      .order('created_at', { ascending: false });
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (cidade) query = query.eq('city', cidade);
+    if (categoria) query = query.contains('categoria_servico', [categoria]);
+    const { data: pros, error } = await query.order('created_at', { ascending: false });
     // DEBUG TEMPORÁRIO 2026-08-20 — remover depois de confirmar o filtro
     // acima ao vivo (achado testando role Thiago/anacristinal1401@gmail.com).
     log('DEBUG professionals', { erro: error?.message || null, total: pros?.length || 0, temThiago: !!(pros || []).find(p => p.id === '7e6a2ff8-0abd-4fea-b02f-5113b5a49b5d') });
@@ -3005,7 +3044,7 @@ app.get('/api/admin/professionals', async (req, res) => {
     ]);
     const assinaturaMap = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
 
-    const professionals = (pros || []).map(p => {
+    let professionals = (pros || []).map(p => {
       const docInfo = docMap[p.email] || {};
       const seus = (pedidos || []).filter(x => x.profissional_aceito === p.email);
       const suasAvaliacoes = (avaliacoes || []).filter(x => x.avaliado_email === p.email);
@@ -3053,6 +3092,7 @@ app.get('/api/admin/professionals', async (req, res) => {
         whatsapp: p.whatsapp,
         city: p.city,
         cep: p.cep,
+        role: p.role,
         categories: p.categoria_servico || [],
         approved: p.approved !== false, // undefined (coluna sumiu por bug de durabilidade) -> fail-open, não trata como reprovado
         docRgUrl: docInfo.doc_rg_url || null,
@@ -3071,10 +3111,75 @@ app.get('/api/admin/professionals', async (req, res) => {
         created_at: p.created_at,
       };
     });
+    // Fase 3: status é sobre aprovação, não sobre engajamento (isso é o
+    // conceito de cliente, "status_engajamento") — "role_divergente" é o
+    // caso que o comentário lá em cima descreve (autonomia aceita, mas
+    // role nunca virou 'professional'), útil pra debugar sem precisar ir
+    // no banco direto.
+    if (status === 'approved') professionals = professionals.filter(p => p.approved);
+    else if (status === 'pendente') professionals = professionals.filter(p => !p.approved);
+    else if (status === 'role_divergente') professionals = professionals.filter(p => p.role !== 'professional');
     res.json({ professionals });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── ADMIN — OPÇÕES DE FILTRO (PROFISSIONAIS) ─────────────────────────────
+// Fase 3 do Admin/CRM. Mesma lógica de "/api/admin/clientes-filtros", mas
+// pro universo de profissionais (mesmo critério .or() da rota principal,
+// pra não oferecer no dropdown uma cidade/categoria que na prática não
+// filtra ninguém). categoria_servico é array — precisa achatar antes do Set.
+app.get('/api/admin/professionals-filtros', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pros, error } = await supabase
+      .from('usuarios')
+      .select('city,categoria_servico')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (error) return res.status(500).json({ error: error.message });
+    const cidades = [...new Set((pros || []).map(p => p.city).filter(Boolean))].sort();
+    const categorias = [...new Set((pros || []).flatMap(p => Array.isArray(p.categoria_servico) ? p.categoria_servico : []))].sort();
+    res.json({ cidades, categorias });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — FICHA DO PROFISSIONAL ────────────────────────────────────────
+// Fase 3 do Admin/CRM, mesmo espírito da ficha 360º do cliente (Fase 1):
+// só dado real, sem tracking/score inventado. Dados pessoais + categorias
+// + pedidos aceitos (profissional_aceito = email), com categoria/valor/
+// status/data — sem timeline (não foi pedido pra profissional nessa fase).
+app.get('/api/admin/professionals/:email', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const email = req.params.email;
+    const { data: pro, error: errPro } = await supabase
+      .from('usuarios')
+      .select('email,name,whatsapp,city,cep,categoria_servico,approved,role,created_at')
+      .eq('email', email)
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null')
+      .maybeSingle();
+    if (errPro) return res.status(500).json({ error: errPro.message });
+    if (!pro) return res.status(404).json({ error: 'Profissional não encontrado' });
+
+    const { data: pedidos, error: errPedidos } = await supabase
+      .from('pedidos')
+      .select('id,created_at,categoria,descricao,valor,status,cliente_nome,cidade')
+      .eq('profissional_aceito', email)
+      .order('created_at', { ascending: false });
+    if (errPedidos) return res.status(500).json({ error: errPedidos.message });
+
+    const concluidos = (pedidos || []).filter(p => p.status === 'concluido');
+    res.json({
+      profissional: { ...pro, categories: pro.categoria_servico || [] },
+      resumo: {
+        pedidos_aceitos: (pedidos || []).length,
+        concluidos: concluidos.length,
+        faturamento: concluidos.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+      },
+      pedidos: pedidos || [],
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ADMIN — Extrato de pagamentos de um profissional ──────────────────────
