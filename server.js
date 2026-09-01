@@ -1272,34 +1272,45 @@ async function buscarOuCriarClienteAsaas({ email, nome, cpf, phone }) {
 // síncrono, dentro do próprio /api/assinatura/cobrar; PIX: assíncrono, só
 // depois que /api/assinatura/confirmar-pix reconfere o status). RLS trava
 // insert/update de "assinaturas" pra service_role (ver comentário acima).
-// "acesso" (Taxa de Acesso) virou entrada única sem renovação — decisão de
-// negócio 31/08/2026, substitui a decisão de 20/08 ("só comissão, sem
-// mensalidade"): agora não é nem mensalidade nem comissão, é só a taxa de
-// entrada, uma vez, pra sempre. Flag (não deleta nada) pra ficar fácil
-// reverter se o modelo mudar de novo depois — mesma filosofia já usada pro
-// código de comissão (nunca chegou a existir de verdade, ver Fase 6 na
-// memória, então não há nada pra desligar ali; aqui SIM existe algo rodando
-// hoje — renovação de cartão via assinatura Asaas e o cron de vencimento do
-// Pix — por isso a flag).
-const RENOVACAO_ACESSO_ATIVA = false;
-
+// "acesso" (Taxa de Acesso) volta a ter renovação mensal — decisão de
+// negócio 2026-09-01, reverte a de 31/08 (que tinha virado entrada única
+// sem renovação, substituindo a de 20/08 "só comissão, sem mensalidade").
+// Modelo definitivo agora: R$ valor_entrada/mês nos primeiros
+// duracao_promocao_meses meses, depois R$ valor_pos_promocao/mês —
+// configurável em runtime via "config_monetizacao" (Configurações →
+// Monetização no MULTI-CRM), nunca mais hardcoded aqui. Ver
+// resolverValorAcesso() logo abaixo — é ela que decide QUANTO cobrar a
+// cada ciclo; esta função só cuida de QUANDO (data) e de gravar o
+// resultado.
 async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, customerId, subscriptionId, cupomCodigo, cortesia }) {
   const inicio = new Date();
-  // Planos que não são "acesso" continuam com ciclo de 30 dias de sempre.
-  // "acesso" só tem proximaCobranca se RENOVACAO_ACESSO_ATIVA for religada —
-  // null aqui vira null em expira_em/proxima_cobranca no banco, que por sua
-  // vez tira essas linhas do radar do cron de lembrete/vencimento (filtro
-  // `.not("proxima_cobranca", "is", null)`) sem precisar mexer no cron.
-  const temRenovacao = plano !== "acesso" || RENOVACAO_ACESSO_ATIVA;
-  const proximaCobranca = temRenovacao ? new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000) : null;
+  const proximaCobranca = new Date(inicio.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+  // taxa_acesso_entrada_em é a âncora FIXA da promoção — a data da primeira
+  // cobrança confirmada de "acesso", nunca sobrescrita numa renovação
+  // (diferente de "inicio", que sempre reflete o início do ciclo ATUAL e é
+  // recalculado a cada renovação, como já valia pros outros planos antes
+  // desta mudança). Sem isso, "2 meses de promoção" resetaria sozinho todo
+  // mês. Só relevante pro plano "acesso" — null pros demais.
+  let taxaAcessoEntradaEm = null;
+  if (plano === "acesso") {
+    const { data: existente } = await supabase
+      .from("assinaturas")
+      .select("taxa_acesso_entrada_em")
+      .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail)
+      .maybeSingle();
+    taxaAcessoEntradaEm = existente?.taxa_acesso_entrada_em || inicio.toISOString();
+  }
+
   const { error } = await supabase.from("assinaturas").upsert({
     titular_tipo: titularTipo,
     titular_email: titularEmail,
     plano,
     status: "ativa",
     inicio: inicio.toISOString(),
-    expira_em: proximaCobranca ? proximaCobranca.toISOString() : null,
-    proxima_cobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
+    expira_em: proximaCobranca.toISOString(),
+    proxima_cobranca: proximaCobranca.toISOString(),
+    taxa_acesso_entrada_em: taxaAcessoEntradaEm,
     asaas_customer_id: customerId,
     asaas_payment_id: paymentId,
     asaas_subscription_id: subscriptionId || null,
@@ -1314,6 +1325,38 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
   }, { onConflict: "titular_tipo,titular_email" });
   if (error) throw error;
   return { proximaCobranca };
+}
+
+// Quanto cobrar AGORA de um titular no plano "acesso" — só esse plano; os
+// demais continuam com PLANOS_ASSINATURA[plano].valor fixo, intocado.
+// Primeira cobrança (nunca teve taxa_acesso_entrada_em) = sempre valor de
+// entrada. Renovação = compara hoje com entrada+duracao_promocao_meses pra
+// saber se ainda tá na janela promocional.
+async function resolverValorAcesso(titularTipo, titularEmail) {
+  const { data: config, error: errCfg } = await supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle();
+  if (errCfg) throw errCfg;
+  if (!config) throw new Error("Config de monetização não encontrada — rode supabase_config_monetizacao_migration.sql");
+
+  const { data: atual } = await supabase
+    .from("assinaturas")
+    .select("taxa_acesso_entrada_em")
+    .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail).eq("plano", "acesso")
+    .maybeSingle();
+
+  if (!atual?.taxa_acesso_entrada_em) {
+    return { valor: Number(config.valor_entrada), dentroDaPromocao: true, entradaEm: null, fimPromocao: null, config };
+  }
+  const entradaEm = new Date(atual.taxa_acesso_entrada_em);
+  const fimPromocao = new Date(entradaEm);
+  fimPromocao.setMonth(fimPromocao.getMonth() + config.duracao_promocao_meses);
+  const dentroDaPromocao = Date.now() < fimPromocao.getTime();
+  return {
+    valor: Number(dentroDaPromocao ? config.valor_entrada : config.valor_pos_promocao),
+    dentroDaPromocao,
+    entradaEm,
+    fimPromocao,
+    config,
+  };
 }
 
 // ── CUPONS (mês grátis pra quem divulga a plataforma) ───────────────────────
@@ -1459,18 +1502,21 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
 
     const customerId = await buscarOuCriarClienteAsaas({ email: titularEmail, nome: titularNome, cpf, phone });
 
-    // "acesso" (Taxa de Acesso) virou cobrança ÚNICA por cartão também —
-    // decisão de negócio 31/08/2026 (RENOVACAO_ACESSO_ATIVA acima). Antes
-    // disso este endpoint criava uma ASSINATURA (POST /subscriptions,
-    // cycle MONTHLY) pra QUALQUER plano, "acesso" incluído — a Asaas cobraria
-    // o cartão de novo sozinha todo mês, pra sempre. Ramo separado, cedo, pra
-    // não passar nem perto do código de assinatura recorrente logo abaixo
-    // (que continua valendo pra autônomo/pro/premium/empresa/empresa_plus,
+    // "acesso" (Taxa de Acesso) cobra por cartão SEM assinatura recorrente
+    // na Asaas (POST /payments avulso, não /subscriptions) — decisão de
+    // negócio que segue valendo mesmo depois da correção de 2026-09-01 (ver
+    // resolverValorAcesso acima): a renovação continua manual (Pix), não
+    // vira cobrança automática de cartão. Ramo separado, cedo, pra não
+    // passar nem perto do código de assinatura recorrente logo abaixo (que
+    // continua valendo pra autônomo/pro/premium/empresa/empresa_plus,
     // intocado). Cupom não se aplica aqui (já bloqueado mais acima, só vale
-    // pro Multi Autônomo).
+    // pro Multi Autônomo). Valor sai de resolverValorAcesso() — R$ de
+    // entrada ou pós-promoção, dependendo de onde essa pessoa já está no
+    // ciclo, não mais um número fixo.
     if (plano === "acesso") {
+      const { valor: valorAcesso, dentroDaPromocao } = await resolverValorAcesso(titularTipo, titularEmail);
       const pay = await asaas.post("/payments", {
-        customer: customerId, billingType: "CREDIT_CARD", value: planoInfo.valor,
+        customer: customerId, billingType: "CREDIT_CARD", value: valorAcesso,
         dueDate: new Date().toISOString().split("T")[0],
         creditCard: { holderName: cardHolder, number: cardNumber, expiryMonth, expiryYear, ccv: cvv },
         creditCardHolderInfo: {
@@ -1478,19 +1524,19 @@ app.post("/api/assinatura/cobrar", async (req, res) => {
           phone: (phone || "").replace(/\D/g, "") || undefined,
           postalCode: "01310100", addressNumber: "1",
         },
-        description: `${planoInfo.label} — pagamento único`,
+        description: `${planoInfo.label} — ${dentroDaPromocao ? "promocional" : "mensalidade"} (cartão)`,
       });
       if (!["CONFIRMED", "RECEIVED"].includes(pay.data.status)) {
-        log("TAXA DE ACESSO COBRANCA PENDENTE (cartão)", { titularEmail, status: pay.data.status, paymentId: pay.data.id });
+        log("TAXA DE ACESSO COBRANCA PENDENTE (cartão)", { titularEmail, status: pay.data.status, paymentId: pay.data.id, valor: valorAcesso });
         return res.status(402).json({ error: "Pagamento não confirmado", status: pay.data.status });
       }
       const { proximaCobranca } = await ativarAssinatura({
         titularTipo, titularEmail, plano, paymentId: pay.data.id, customerId,
-        subscriptionId: null, // sem assinatura recorrente — cobrança única
+        subscriptionId: null, // sem assinatura recorrente — cobrança avulsa por ciclo
       });
-      log("TAXA DE ACESSO ATIVADA (cartão, cobrança única)", { titularEmail, paymentId: pay.data.id });
+      log("TAXA DE ACESSO ATIVADA (cartão)", { titularEmail, paymentId: pay.data.id, valor: valorAcesso, dentroDaPromocao });
       return res.json({
-        success: true, status: "ativa", cortesia: false, valor: planoInfo.valor,
+        success: true, status: "ativa", cortesia: false, valor: valorAcesso,
         proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
         subscriptionId: null,
       });
@@ -1630,28 +1676,41 @@ app.post("/api/assinatura/gerar-pix", async (req, res) => {
         cortesia: true,
         status: "ativa",
         customerId,
-        valor: planoInfo.valor,
+        valor: planoInfo.valor, // cupom só vale pro Multi Autônomo, nunca "acesso" — bloqueado mais acima
         proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
       });
     }
 
+    // "acesso": valor sai de resolverValorAcesso() (promocional ou
+    // mensalidade, conforme o ciclo dessa pessoa) — os demais planos
+    // continuam com PLANOS_ASSINATURA[plano].valor fixo, intocado.
+    let valorCobranca = planoInfo.valor;
+    let dentroDaPromocaoAcesso = null;
+    if (plano === "acesso") {
+      const resolvido = await resolverValorAcesso(titularTipo, titularEmail);
+      valorCobranca = resolvido.valor;
+      dentroDaPromocaoAcesso = resolvido.dentroDaPromocao;
+    }
+
     const pay = await asaas.post("/payments", {
-      customer: customerId, billingType: "PIX", value: planoInfo.valor,
+      customer: customerId, billingType: "PIX", value: valorCobranca,
       dueDate: new Date().toISOString().split("T")[0],
-      description: `${planoInfo.label} — assinatura mensal (PIX)`,
+      description: plano === "acesso"
+        ? `${planoInfo.label} — ${dentroDaPromocaoAcesso ? "promocional" : "mensalidade"} (Pix)`
+        : `${planoInfo.label} — assinatura mensal (PIX)`,
       externalReference: `plano:${titularTipo}:${titularEmail}:${plano}`,
     });
 
     const qr = await asaas.get(`/payments/${pay.data.id}/pixQrCode`);
 
-    log("ASSINATURA PIX GERADO", { titularEmail, plano, paymentId: pay.data.id });
+    log("ASSINATURA PIX GERADO", { titularEmail, plano, paymentId: pay.data.id, valor: valorCobranca });
     res.json({
       paymentId: pay.data.id,
       customerId,
       pixCode: qr.data.payload,
       qrCodeBase64: qr.data.encodedImage,
       expiresAt: qr.data.expirationDate,
-      value: planoInfo.valor,
+      value: valorCobranca,
     });
   } catch (e) {
     log("ERRO assinatura/gerar-pix", e.response?.data || e.message || e);
@@ -1684,11 +1743,11 @@ app.post("/api/assinatura/confirmar-pix", async (req, res) => {
       customerId: customerId || pay.customer,
     });
 
-    log("ASSINATURA PIX ATIVADA", { titularEmail, plano, paymentId });
+    log("ASSINATURA PIX ATIVADA", { titularEmail, plano, paymentId, valor: pay.value });
     res.json({
       success: true,
       status: "ativa",
-      valor: planoInfo.valor,
+      valor: pay.value, // valor real do pagamento confirmado na Asaas, não mais o fixo de PLANOS_ASSINATURA — importante pro "acesso", que agora tem valor variável por ciclo (ver resolverValorAcesso)
       proximaCobranca: proximaCobranca ? proximaCobranca.toISOString() : null,
       paymentId,
     });
@@ -1758,6 +1817,11 @@ app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
   if (!planoInfo) return res.status(400).json({ error: "Plano inválido" });
 
   try {
+    // Valor sai de resolverValorAcesso() — promocional ou mensalidade,
+    // conforme o ciclo dessa pessoa (correção do modelo financeiro,
+    // 2026-09-01). Antes disso era sempre planoInfo.valor fixo.
+    const { valor: valorAcesso, dentroDaPromocao } = await resolverValorAcesso(titularTipo, titularEmail);
+
     // txid curto e legível pro extrato do Nubank — não precisa ser sigiloso,
     // só único o bastante pra achar o pagamento certo na conciliação manual.
     const txid = "ACESSO" + crypto.createHash("sha1").update(titularEmail + Date.now()).digest("hex").slice(0, 12).toUpperCase();
@@ -1765,7 +1829,7 @@ app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
       chave: CHAVE_PIX_NUBANK_PJ,
       nome: "MULTI SERVICOS",
       cidade: "GUARULHOS",
-      valor: planoInfo.valor,
+      valor: valorAcesso,
       txid,
     });
     const qrCodeBase64 = (await QRCode.toDataURL(pixCode, { margin: 1, width: 400 })).split(",")[1];
@@ -1781,8 +1845,8 @@ app.post("/api/assinatura/gerar-pix-manual", async (req, res) => {
       .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail);
     if (errTxid) log("AVISO gerar-pix-manual: não gravou txid na assinatura pendente", { titularEmail, txid, erro: errTxid.message });
 
-    log("PIX MANUAL GERADO (fallback emergencial)", { titularEmail, plano, txid });
-    res.json({ txid, pixCode, qrCodeBase64, valor: planoInfo.valor, manual: true });
+    log("PIX MANUAL GERADO (fallback emergencial)", { titularEmail, plano, txid, valor: valorAcesso, dentroDaPromocao });
+    res.json({ txid, pixCode, qrCodeBase64, valor: valorAcesso, dentroDaPromocao, manual: true });
   } catch (e) {
     log("ERRO assinatura/gerar-pix-manual", e.message || e);
     res.status(500).json({ error: e.message || "Erro ao gerar Pix manual" });
@@ -1797,7 +1861,7 @@ app.get("/api/admin/pix-manual-pendentes", async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { data: pendentes, error } = await supabase.from("assinaturas")
-      .select("titular_tipo,titular_email,plano,pix_manual_txid,pix_manual_gerado_em")
+      .select("titular_tipo,titular_email,plano,pix_manual_txid,pix_manual_gerado_em,taxa_acesso_entrada_em")
       .eq("status", "pendente").not("pix_manual_txid", "is", null)
       .order("pix_manual_gerado_em", { ascending: false });
     if (error) throw error;
@@ -1806,11 +1870,22 @@ app.get("/api/admin/pix-manual-pendentes", async (req, res) => {
       ? await supabase.from("usuarios").select("email,name,whatsapp").in("email", emails)
       : { data: [] };
     const porEmail = Object.fromEntries((usuarios || []).map(u => [u.email, u]));
+    // "acesso" tem valor variável por ciclo (ver resolverValorAcesso) — busca
+    // a config uma vez só aqui, em vez de uma query por linha.
+    const { data: configMonetizacao } = await supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle();
+    const valorDaLinha = (p) => {
+      if (p.plano !== "acesso") return PLANOS_ASSINATURA[p.plano]?.valor ?? null;
+      if (!configMonetizacao) return PLANOS_ASSINATURA.acesso?.valor ?? null; // config sumiu — fallback pro valor antigo, não quebra a lista
+      if (!p.taxa_acesso_entrada_em) return Number(configMonetizacao.valor_entrada);
+      const fim = new Date(p.taxa_acesso_entrada_em);
+      fim.setMonth(fim.getMonth() + configMonetizacao.duracao_promocao_meses);
+      return Number(Date.now() < fim.getTime() ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao);
+    };
     const lista = (pendentes || []).map(p => ({
       titularTipo: p.titular_tipo,
       titularEmail: p.titular_email,
       plano: p.plano,
-      valor: PLANOS_ASSINATURA[p.plano]?.valor ?? null,
+      valor: valorDaLinha(p),
       txid: p.pix_manual_txid,
       geradoEm: p.pix_manual_gerado_em,
       nome: porEmail[p.titular_email]?.name || null,
@@ -2372,6 +2447,45 @@ app.patch("/api/admin/equipe/:id", async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: "Pessoa não encontrada" });
     res.json({ pessoa: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONFIG DE MONETIZAÇÃO — correção do modelo financeiro real (MULTI-CRM),
+// ver memória do projeto. Linha única (id=1) em "config_monetizacao" — os
+// valores que hoje moravam hardcoded em PLANOS_ASSINATURA.acesso. Só afeta
+// o plano "acesso" (Taxa de Acesso); os outros planos não leem daqui.
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET liberado pra qualquer pessoa logada no CRM (não só administrador) —
+// vendedor/atendimento também precisam saber o valor vigente pra responder
+// profissional, só não podem EDITAR (isso sim é só administrador, no PATCH).
+app.get("/api/admin/config-monetizacao", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: "Config de monetização não encontrada — rode a migration" });
+    res.json({ config: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch("/api/admin/config-monetizacao", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  if (!requireRole(req, res, ["administrador"])) return;
+  try {
+    const CAMPOS = ["modelo_cobranca", "valor_entrada", "duracao_promocao_meses", "valor_pos_promocao", "comissao_ativa", "comissao_percentual", "comissao_base"];
+    const updates = {};
+    for (const campo of CAMPOS) if (req.body?.[campo] !== undefined) updates[campo] = req.body[campo];
+    if (!Object.keys(updates).length) return res.status(400).json({ error: "Nada para atualizar" });
+    if (updates.valor_entrada != null && updates.valor_entrada <= 0) return res.status(400).json({ error: "valor_entrada precisa ser positivo" });
+    if (updates.valor_pos_promocao != null && updates.valor_pos_promocao <= 0) return res.status(400).json({ error: "valor_pos_promocao precisa ser positivo" });
+    if (updates.duracao_promocao_meses != null && updates.duracao_promocao_meses < 1) return res.status(400).json({ error: "duracao_promocao_meses precisa ser pelo menos 1" });
+    updates.updated_at = new Date().toISOString();
+    updates.updated_by = req.adminAuth.userId || null; // null pra quem ainda loga com o token antigo (sem userId) — não trava a edição por isso
+    const { data, error } = await supabase.from("config_monetizacao").update(updates).eq("id", 1).select("*").maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ config: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3173,11 +3287,15 @@ app.get('/api/admin/professionals', async (req, res) => {
       // nunca consultada aqui antes — o painel achava que ninguém era PRO.
       emails.length
         ? supabase.from('assinaturas')
-            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia,asaas_customer_id')
+            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia,asaas_customer_id,taxa_acesso_entrada_em')
             .eq('titular_tipo', 'usuario').in('titular_email', emails)
         : Promise.resolve({ data: [] }),
     ]);
     const assinaturaMap = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+    // Ciclo financeiro do plano "acesso" (correção do modelo financeiro,
+    // 2026-09-01, ver memória do projeto) — busca a config uma vez só,
+    // fora do map abaixo.
+    const { data: configMonetizacao } = await supabase.from('config_monetizacao').select('*').eq('id', 1).maybeSingle();
 
     let professionals = (pros || []).map(p => {
       const docInfo = docMap[p.email] || {};
@@ -3220,6 +3338,33 @@ app.get('/api/admin/professionals', async (req, res) => {
         }
       }
 
+      // Ciclo financeiro — só existe (não-null) pra quem tem assinatura no
+      // plano "acesso". status: 'promocao_ativa' (🟢) / 'promocao_terminando'
+      // (🟡, últimos 7 dias antes do fim) / 'mensalidade_ativa' (🟢, já
+      // passou da promoção) / 'em_atraso' (🔴, reaproveita paymentStatus
+      // 'vencido' já calculado acima, mesma definição pro resto do painel).
+      let cicloFinanceiro = null;
+      if (assinatura && plano === 'acesso' && configMonetizacao) {
+        const entradaEm = assinatura.taxa_acesso_entrada_em;
+        const fimPromocao = entradaEm ? new Date(entradaEm) : null;
+        if (fimPromocao) fimPromocao.setMonth(fimPromocao.getMonth() + configMonetizacao.duracao_promocao_meses);
+        const dentroDaPromocao = !fimPromocao || Date.now() < fimPromocao.getTime();
+        const diasParaFimPromocao = fimPromocao ? Math.ceil((fimPromocao.getTime() - Date.now()) / 86400000) : null;
+        let statusCiclo;
+        if (paymentStatus === 'vencido') statusCiclo = 'em_atraso';
+        else if (!dentroDaPromocao) statusCiclo = 'mensalidade_ativa';
+        else if (diasParaFimPromocao != null && diasParaFimPromocao <= 7) statusCiclo = 'promocao_terminando';
+        else statusCiclo = 'promocao_ativa';
+        cicloFinanceiro = {
+          plano_atual: dentroDaPromocao ? 'promocional' : 'mensalidade',
+          data_entrada: entradaEm || null,
+          fim_promocao: fimPromocao ? fimPromocao.toISOString() : null,
+          proxima_cobranca: assinatura.proxima_cobranca || null,
+          valor_proxima_cobranca: Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao),
+          status: statusCiclo,
+        };
+      }
+
       return {
         id: p.id,
         email: p.email,
@@ -3239,6 +3384,7 @@ app.get('/api/admin/professionals', async (req, res) => {
         cortesia: !!assinatura?.cortesia,
         proximaCobranca: assinatura?.proxima_cobranca || null,
         pro_since: assinatura?.inicio || null,
+        ciclo_financeiro: cicloFinanceiro,
         services_count: seus.length,
         open_services: seus.filter(s => s.status === 'aberto').length,
         revenue: seus.reduce((s, x) => s + (Number(x.valor) || 0), 0),
@@ -3304,9 +3450,44 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
       .order('created_at', { ascending: false });
     if (errPedidos) return res.status(500).json({ error: errPedidos.message });
 
+    // Ciclo financeiro (correção do modelo financeiro, 2026-09-01) — mesmo
+    // cálculo de /api/admin/professionals, só que pra uma pessoa só. Só
+    // preenche se o plano dela for "acesso" de verdade.
+    let cicloFinanceiro = null;
+    const { data: assinatura } = await supabase
+      .from('assinaturas')
+      .select('plano,status,proxima_cobranca,taxa_acesso_entrada_em')
+      .eq('titular_tipo', 'usuario').eq('titular_email', email)
+      .maybeSingle();
+    if (assinatura?.plano === 'acesso') {
+      const { data: configMonetizacao } = await supabase.from('config_monetizacao').select('*').eq('id', 1).maybeSingle();
+      if (configMonetizacao) {
+        const entradaEm = assinatura.taxa_acesso_entrada_em;
+        const fimPromocao = entradaEm ? new Date(entradaEm) : null;
+        if (fimPromocao) fimPromocao.setMonth(fimPromocao.getMonth() + configMonetizacao.duracao_promocao_meses);
+        const dentroDaPromocao = !fimPromocao || Date.now() < fimPromocao.getTime();
+        const diasParaFimPromocao = fimPromocao ? Math.ceil((fimPromocao.getTime() - Date.now()) / 86400000) : null;
+        const proximaCobrancaVencida = assinatura.proxima_cobranca && new Date(assinatura.proxima_cobranca).getTime() < Date.now();
+        let statusCiclo;
+        if (assinatura.status === 'inadimplente' || proximaCobrancaVencida) statusCiclo = 'em_atraso';
+        else if (!dentroDaPromocao) statusCiclo = 'mensalidade_ativa';
+        else if (diasParaFimPromocao != null && diasParaFimPromocao <= 7) statusCiclo = 'promocao_terminando';
+        else statusCiclo = 'promocao_ativa';
+        cicloFinanceiro = {
+          plano_atual: dentroDaPromocao ? 'promocional' : 'mensalidade',
+          data_entrada: entradaEm || null,
+          fim_promocao: fimPromocao ? fimPromocao.toISOString() : null,
+          proxima_cobranca: assinatura.proxima_cobranca || null,
+          valor_proxima_cobranca: Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao),
+          status: statusCiclo,
+        };
+      }
+    }
+
     const concluidos = (pedidos || []).filter(p => p.status === 'concluido');
     res.json({
       profissional: { ...pro, categories: pro.categoria_servico || [] },
+      ciclo_financeiro: cicloFinanceiro,
       resumo: {
         pedidos_aceitos: (pedidos || []).length,
         concluidos: concluidos.length,
@@ -4126,23 +4307,19 @@ app.post("/api/cron/lembretes", async (req, res) => {
     // Asaas, então só pode ter sido Pix avulso (asaas_payment_id preenchido)
     // — sem precisar de coluna nova pra guardar o método.
     //
-    // DESLIGADO (31/08/2026, RENOVACAO_ACESSO_ATIVA=false): "acesso" virou
-    // entrada única sem vencimento — ativarAssinatura() já grava
-    // proxima_cobranca=null pra esse plano, então o filtro
-    // .not("proxima_cobranca","is",null) abaixo já esvazia a lista sozinho
-    // pra ativações novas. Guarda explícita aqui é só reforço/clareza — e
-    // cobre as 28 linhas antigas que ainda tinham proxima_cobranca preenchida
-    // até a migration de limpeza rodar. Não removido: religar é só voltar a
-    // flag pra true.
-    if (!RENOVACAO_ACESSO_ATIVA) {
-      log("LEMBRETES taxa_acesso_pix — pulado (RENOVACAO_ACESSO_ATIVA=false)");
-    } else
+    // RELIGADO (2026-09-01, correção do modelo financeiro — ver
+    // resolverValorAcesso acima): "acesso" volta a ter vencimento mensal.
+    // Busca a config uma vez só (fora do loop) pra saber o valor certo de
+    // cada lembrete — promocional ou mensalidade, conforme
+    // taxa_acesso_entrada_em de cada pessoa.
     try {
+      const { data: configMonetizacao, error: errConfig } = await supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle();
+      if (errConfig) throw errConfig;
       const agoraMs = Date.now();
       const emTresDias = new Date(agoraMs + 3 * 24 * 60 * 60 * 1000).toISOString();
       const { data: assinaturasAcesso, error: errAcesso } = await supabase
         .from("assinaturas")
-        .select("titular_email,status,proxima_cobranca,lembrete_pix_enviado_em")
+        .select("titular_email,status,proxima_cobranca,lembrete_pix_enviado_em,taxa_acesso_entrada_em")
         .eq("titular_tipo", "usuario").eq("plano", "acesso")
         .is("asaas_subscription_id", null)
         .in("status", ["ativa", "trial"])
@@ -4165,20 +4342,29 @@ app.post("/api/cron/lembretes", async (req, res) => {
           } else if (!a.lembrete_pix_enviado_em) {
             // Ainda dentro dos 3 dias antes do vencimento, primeiro aviso
             // desse ciclo — manda e-mail e marca pra não repetir amanhã.
+            // Valor do lembrete reflete o ciclo real dessa pessoa (promoção
+            // ou mensalidade) — não é mais "R$ 9,90" fixo pra sempre.
+            let valorCiclo = configMonetizacao ? Number(configMonetizacao.valor_entrada) : 9.90;
+            if (configMonetizacao && a.taxa_acesso_entrada_em) {
+              const fim = new Date(a.taxa_acesso_entrada_em);
+              fim.setMonth(fim.getMonth() + configMonetizacao.duracao_promocao_meses);
+              if (Date.now() >= fim.getTime()) valorCiclo = Number(configMonetizacao.valor_pos_promocao);
+            }
+            const valorFmt = valorCiclo.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const dataVencStr = new Date(a.proxima_cobranca).toLocaleDateString("pt-BR");
             await mailer.send({
               to: a.titular_email, from: FROM,
               subject: "Sua Taxa de Acesso Multi vence em breve",
               html: layout(`
                 <h2 style="color:#1a1a2e;margin:0 0 8px">Sua taxa de acesso vence em breve</h2>
-                <p style="color:#555;line-height:1.7">Sua Taxa de Acesso Multi (R$ 9,90) vence em <strong>${dataVencStr}</strong>. Como o pagamento foi por Pix, a renovação não é automática — gere um novo Pix no app antes do vencimento pra continuar visível no mural.</p>
+                <p style="color:#555;line-height:1.7">Sua Taxa de Acesso Multi (R$ ${valorFmt}) vence em <strong>${dataVencStr}</strong>. Como o pagamento foi por Pix, a renovação não é automática — gere um novo Pix no app antes do vencimento pra continuar visível no mural.</p>
                 <a href="${APP_URL}" style="display:inline-block;background:linear-gradient(135deg,#FF6B35,#E64A19);color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700">Renovar agora →</a>
               `),
             });
             await supabase.from("assinaturas").update({ lembrete_pix_enviado_em: new Date().toISOString() })
               .eq("titular_tipo", "usuario").eq("titular_email", a.titular_email).eq("plano", "acesso");
             resumo.notificados++;
-            console.log(`[LEMBRETES] taxa_acesso_pix — ${a.titular_email} — e-mail de lembrete enviado`);
+            console.log(`[LEMBRETES] taxa_acesso_pix — ${a.titular_email} — e-mail de lembrete enviado (R$ ${valorFmt})`);
           }
         } catch (e) {
           resumo.erros.push({ titular_email: a.titular_email, erro: e.message });
