@@ -12,7 +12,18 @@ const QRCode   = require("qrcode");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-const allowedOrigins = [process.env.FRONTEND_URL, "https://localhost", "capacitor://localhost", "http://localhost"].filter(Boolean);
+// ADMIN_FRONTEND_URL: domínio do novo Admin/CRM (MULTI-CRM, projeto Vercel
+// separado do app cliente/profissional — Fase 1, ver memória do projeto).
+// Segue exatamente o mesmo padrão de FRONTEND_URL abaixo (com/sem "www").
+// Enquanto não tiver domínio próprio configurado, os alias padrão do
+// Vercel (produção sem hash) já entram fixos na lista logo abaixo.
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.ADMIN_FRONTEND_URL,
+  "https://multi-crm.vercel.app",
+  "https://multi-crm-anacristinal1401-2650s-projects.vercel.app",
+  "https://localhost", "capacitor://localhost", "http://localhost",
+].filter(Boolean);
 // Aceita também a variante com/sem "www." de FRONTEND_URL. Achado
 // 2026-08-24: cliente reportou "Failed to fetch" travado em "Criando
 // conta..." no site; www.multifuncao.com.br serve o site normalmente (sem
@@ -20,18 +31,21 @@ const allowedOrigins = [process.env.FRONTEND_URL, "https://localhost", "capacito
 // estava na lista — qualquer visitante que chegasse pelo www tinha TODA
 // chamada de API bloqueada por CORS, confirmado reproduzindo direto com
 // curl contra o backend em produção (204 sem www, 500 com www).
-if (process.env.FRONTEND_URL) {
+for (const envUrl of [process.env.FRONTEND_URL, process.env.ADMIN_FRONTEND_URL]) {
+  if (!envUrl) continue;
   try {
-    const u = new URL(process.env.FRONTEND_URL);
+    const u = new URL(envUrl);
     const altHost = u.hostname.startsWith("www.") ? u.hostname.slice(4) : "www." + u.hostname;
     allowedOrigins.push(`${u.protocol}//${altHost}`);
-  } catch (_) { /* FRONTEND_URL mal formada — ignora, resto da lista continua valendo */ }
+  } catch (_) { /* URL mal formada — ignora, resto da lista continua valendo */ }
 }
-// Previews do Vercel (deploy de teste do MULTI antes de ir pra produção)
-// ganham uma URL aleatória tipo https://multi-<hash>-anacristinal1401-2650s-projects.vercel.app
-// a cada "vercel deploy" — não dá pra colocar fixo em allowedOrigins. Libera
-// só esse padrão específico do projeto, não *.vercel.app inteiro.
-const previewOriginRegex = /^https:\/\/multi-[a-z0-9]+-anacristinal1401-2650s-projects\.vercel\.app$/;
+// Previews do Vercel (deploy de teste, tanto do MULTI quanto do novo
+// MULTI-CRM) ganham uma URL aleatória a cada deploy, tipo
+// https://multi-<hash>-anacristinal1401-2650s-projects.vercel.app ou
+// https://multi-crm-<hash>-anacristinal1401-2650s-projects.vercel.app —
+// não dá pra colocar fixo em allowedOrigins. Libera qualquer projeto Vercel
+// desse time cujo nome comece com "multi", não *.vercel.app inteiro.
+const previewOriginRegex = /^https:\/\/multi(?:-[a-z0-9]+)*-[a-z0-9]+-anacristinal1401-2650s-projects\.vercel\.app$/;
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true); // requisições sem Origin (curl, server-to-server)
@@ -2321,6 +2335,13 @@ app.get('/api/admin/clientes', async (req, res) => {
     const { data: pedidos } = emails.length
       ? await supabase.from('pedidos').select('cliente_id,status,valor').in('cliente_id', emails)
       : { data: [] };
+    // Propostas recebidas por cliente — pedido pelo novo Admin/CRM (Fase 1,
+    // ver memória do projeto). "propostas.cliente_email" já existe e bate
+    // com o mesmo e-mail usado em "pedidos.cliente_id", então dá pra contar
+    // direto sem passar por pedidos.id.
+    const { data: propostas } = emails.length
+      ? await supabase.from('propostas').select('cliente_email').in('cliente_email', emails)
+      : { data: [] };
 
     const result = (clientes || []).map(c => {
       const seus = (pedidos || []).filter(p => p.cliente_id === c.email);
@@ -2330,10 +2351,89 @@ app.get('/api/admin/clientes', async (req, res) => {
         services_count: seus.length,
         completed_count: concluidos.length,
         valor_movimentado: concluidos.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+        // Campos novos, Fase 1 do Admin/CRM. "status_engajamento" é
+        // nome distinto de propósito (não sobrescreve "usuarios.status",
+        // que já existe com outro sentido — aprovação/doc do lado
+        // profissional, não engajamento do cliente): deriva só de existir
+        // ou não pedido, como pedido na spec ("ativo / nunca solicitou nada").
+        propostas_recebidas: (propostas || []).filter(p => p.cliente_email === c.email).length,
+        status_engajamento: seus.length ? 'ativo' : 'sem_solicitacao',
       };
     });
     res.json(result);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — FICHA 360º DO CLIENTE ────────────────────────────────────────
+// Novo Admin/CRM (MULTI-CRM, projeto separado) — Fase 1, ver memória do
+// projeto. Sem tabela nova, sem invenção: dados pessoais de "usuarios",
+// todas as solicitações de "pedidos", propostas recebidas em cada uma
+// (join com "propostas"), e uma timeline montada só com colunas de
+// timestamp que já existem de verdade em "pedidos" (created_at,
+// aceite_formal_cliente_em/profissional_em, inicio_confirmado_em,
+// concluido_em, contestado_em) — nada de evento simulado. Não existe
+// event tracking hoje (login, categoria vista etc.) então "última visita"
+// e afins ficam de fora de propósito, fase futura.
+app.get('/api/admin/clientes/:email', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const email = req.params.email;
+    const { data: cliente, error: errCliente } = await supabase
+      .from('usuarios')
+      .select('email,name,whatsapp,city,created_at,role,approved')
+      .eq('email', email)
+      .eq('role', 'client')
+      .maybeSingle();
+    if (errCliente) return res.status(500).json({ error: errCliente.message });
+    if (!cliente) return res.status(404).json({ error: 'Cliente não encontrado' });
+
+    const { data: pedidos, error: errPedidos } = await supabase
+      .from('pedidos')
+      .select('id,created_at,categoria,descricao,valor,status,cidade,bairro,urgencia,profissional_nome,aceite_formal_cliente_em,aceite_formal_profissional_em,inicio_confirmado_em,concluido_em,contestado_em,contestacao_motivo')
+      .eq('cliente_id', email)
+      .order('created_at', { ascending: false });
+    if (errPedidos) return res.status(500).json({ error: errPedidos.message });
+
+    const pedidoIds = (pedidos || []).map(p => p.id);
+    const { data: propostas } = pedidoIds.length
+      ? await supabase.from('propostas').select('id,pedido_id,valor,status,created_at,profissional_nome').in('pedido_id', pedidoIds)
+      : { data: [] };
+
+    const solicitacoes = (pedidos || []).map(p => ({
+      ...p,
+      propostas: (propostas || []).filter(pr => pr.pedido_id === p.id),
+    }));
+
+    // Timeline: um evento por linha de timestamp real encontrada, de todas
+    // as solicitações do cliente juntas, ordenada do mais antigo pro mais
+    // recente.
+    const timeline = [];
+    for (const p of (pedidos || [])) {
+      if (p.created_at) timeline.push({ data: p.created_at, tipo: 'solicitacao', descricao: `Solicitou "${p.categoria || 'serviço'}"`, pedido_id: p.id });
+      for (const pr of (propostas || []).filter(pr => pr.pedido_id === p.id)) {
+        if (pr.created_at) timeline.push({ data: pr.created_at, tipo: 'proposta_recebida', descricao: `Recebeu proposta${pr.profissional_nome ? ' de ' + pr.profissional_nome : ''}${pr.valor != null ? ' — R$ ' + pr.valor : ''}`, pedido_id: p.id });
+      }
+      if (p.aceite_formal_cliente_em) timeline.push({ data: p.aceite_formal_cliente_em, tipo: 'aceite_cliente', descricao: 'Aceitou a proposta', pedido_id: p.id });
+      if (p.aceite_formal_profissional_em) timeline.push({ data: p.aceite_formal_profissional_em, tipo: 'aceite_profissional', descricao: 'Profissional confirmou o aceite', pedido_id: p.id });
+      if (p.inicio_confirmado_em) timeline.push({ data: p.inicio_confirmado_em, tipo: 'inicio', descricao: 'Início do serviço confirmado', pedido_id: p.id });
+      if (p.concluido_em) timeline.push({ data: p.concluido_em, tipo: 'concluido', descricao: 'Serviço concluído', pedido_id: p.id });
+      if (p.contestado_em) timeline.push({ data: p.contestado_em, tipo: 'contestado', descricao: `Contestado${p.contestacao_motivo ? ': ' + p.contestacao_motivo : ''}`, pedido_id: p.id });
+    }
+    timeline.sort((a, b) => new Date(a.data) - new Date(b.data));
+
+    const concluidos = (pedidos || []).filter(p => p.status === 'concluido');
+    res.json({
+      cliente,
+      resumo: {
+        solicitacoes_count: (pedidos || []).length,
+        propostas_recebidas: (propostas || []).length,
+        fechamentos_count: concluidos.length,
+        valor_movimentado: concluidos.reduce((s, p) => s + (Number(p.valor) || 0), 0),
+      },
+      solicitacoes,
+      timeline,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ADMIN — EMPRESAS ─────────────────────────────────────────────────────
