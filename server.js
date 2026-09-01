@@ -9,6 +9,7 @@ const axios    = require("axios");
 const cors     = require("cors");
 const crypto   = require("crypto");
 const QRCode   = require("qrcode");
+const bcrypt   = require("bcryptjs"); // Fase 4 do MULTI-CRM — hash de senha da equipe (crm_equipe.senha_hash)
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -2197,31 +2198,61 @@ app.post("/api/cobrar-cartao", async (req, res) => {
 // só no servidor, expira em 24h); o frontend nunca mais guarda a senha, só
 // o token.
 // ════════════════════════════════════════════════════════════════════════════
-function signAdminToken() {
+// Fase 4 do MULTI-CRM (login por pessoa, ver memória do projeto): o token
+// agora pode carregar identidade (userId/nome/role) além do "exp", pra
+// distinguir QUEM tá logado, não só "é admin ou não". "extra" é opcional de
+// propósito — POST /api/admin/login (senha única, usada pelo Admin antigo,
+// AdminDashboard.jsx) continua chamando signAdminToken() sem argumento, e
+// esse token segue 100% válido nas ~55 rotas /api/admin/* já existentes,
+// tratado como administrador implícito (ver checkAdminKey). Nada do que já
+// funciona muda de comportamento.
+function signAdminToken(extra = {}) {
   const exp = Date.now() + 1000 * 60 * 60 * 24; // 24h
-  const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ ...extra, exp })).toString("base64url");
   const sig = crypto.createHmac("sha256", process.env.ADMIN_TOKEN_SECRET).update(payload).digest("base64url");
   return `${payload}.${sig}`;
 }
 
+// Antes devolvia só true/false; agora devolve o payload decodificado (ou
+// null se inválido/expirado) pra quem precisar saber quem é. checkAdminKey
+// abaixo continua com a mesma checagem booleana de sempre pras rotas que só
+// precisam saber "pode ou não" — nada existente foi obrigado a mudar.
 function verifyAdminToken(token) {
-  if (!process.env.ADMIN_TOKEN_SECRET || typeof token !== "string") return false;
+  if (!process.env.ADMIN_TOKEN_SECRET || typeof token !== "string") return null;
   const [payload, sig] = token.split(".");
-  if (!payload || !sig) return false;
+  if (!payload || !sig) return null;
   const expected = crypto.createHmac("sha256", process.env.ADMIN_TOKEN_SECRET).update(payload).digest("base64url");
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expected);
-  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return null;
   try {
-    return JSON.parse(Buffer.from(payload, "base64url").toString()).exp > Date.now();
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString());
+    return decoded.exp > Date.now() ? decoded : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 function checkAdminKey(req, res) {
-  if (!verifyAdminToken(req.headers["x-admin-key"])) {
+  const auth = verifyAdminToken(req.headers["x-admin-key"]);
+  if (!auth) {
     res.status(401).json({ error: "Não autorizado" });
+    return false;
+  }
+  // Token antigo (senha única do Admin Panel, sem "role" no payload) segue
+  // valendo como administrador — é assim que o Admin antigo sempre operou,
+  // sem noção de papel nenhuma, sempre full-access.
+  req.adminAuth = { role: "administrador", ...auth };
+  return true;
+}
+
+// Só pras rotas novas da Fase 4 (gestão de equipe) — mesmo estilo de
+// checkAdminKey (função simples, "if (!fn(req,res)) return;"), não
+// middleware Express, pra combinar com o resto do arquivo. Exige
+// checkAdminKey já ter rodado antes (req.adminAuth precisa existir).
+function requireRole(req, res, roles) {
+  if (!req.adminAuth || !roles.includes(req.adminAuth.role)) {
+    res.status(403).json({ error: "Sem permissão para esta ação" });
     return false;
   }
   return true;
@@ -2238,6 +2269,110 @@ app.post("/api/admin/login", (req, res) => {
     return res.status(401).json({ error: "Senha incorreta" });
   }
   res.json({ token: signAdminToken() });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// EQUIPE DO MULTI-CRM — Fase 4 (login por pessoa), ver memória do projeto.
+// Tabela nova "crm_equipe" (migration: supabase_crm_equipe_migration.sql),
+// separada de "usuarios" (que é cliente/profissional da plataforma, não tem
+// nada a ver com quem trabalha na Multi). Login aqui é só pro MULTI-CRM —
+// o Admin antigo (AdminDashboard.jsx) continua na senha única de sempre,
+// /api/admin/login acima, intocado.
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /api/admin/equipe/login — email+senha (não a senha única do Admin
+// antigo). Token carrega userId/nome/role, não só "é admin ou não".
+app.post("/api/admin/equipe/login", async (req, res) => {
+  if (!process.env.ADMIN_TOKEN_SECRET) {
+    return res.status(500).json({ error: "Login não configurado no servidor" });
+  }
+  try {
+    const { email, senha } = req.body || {};
+    if (!email || !senha) return res.status(400).json({ error: "Informe email e senha" });
+    const { data: pessoa, error } = await supabase
+      .from("crm_equipe")
+      .select("id,nome,email,senha_hash,role,ativo")
+      .ilike("email", email.trim())
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    // Mesma mensagem genérica pra email inexistente e senha errada — não dar
+    // pista se o email existe ou não no sistema.
+    if (!pessoa || !pessoa.ativo) return res.status(401).json({ error: "Email ou senha incorretos" });
+    const ok = await bcrypt.compare(senha, pessoa.senha_hash);
+    if (!ok) return res.status(401).json({ error: "Email ou senha incorretos" });
+    const token = signAdminToken({ userId: pessoa.id, nome: pessoa.nome, role: pessoa.role });
+    res.json({ token, nome: pessoa.nome, role: pessoa.role });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET/POST/PATCH /api/admin/equipe — gestão de equipe, só Administrador.
+// Nunca devolve senha_hash em lugar nenhum.
+app.get("/api/admin/equipe", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  if (!requireRole(req, res, ["administrador"])) return;
+  try {
+    const { data, error } = await supabase
+      .from("crm_equipe")
+      .select("id,nome,email,role,ativo,created_at")
+      .order("created_at", { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ equipe: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/admin/equipe", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  if (!requireRole(req, res, ["administrador"])) return;
+  try {
+    const { nome, email, senha, role } = req.body || {};
+    const ROLES_VALIDAS = ["administrador", "gerente", "vendedor", "atendimento", "operacao"];
+    if (!nome || !email || !senha || !ROLES_VALIDAS.includes(role)) {
+      return res.status(400).json({ error: "Informe nome, email, senha e um role válido (" + ROLES_VALIDAS.join(", ") + ")" });
+    }
+    if (senha.length < 8) return res.status(400).json({ error: "Senha precisa ter pelo menos 8 caracteres" });
+    const senha_hash = await bcrypt.hash(senha, 10);
+    const { data, error } = await supabase
+      .from("crm_equipe")
+      .insert({ nome, email: email.trim(), senha_hash, role })
+      .select("id,nome,email,role,ativo,created_at")
+      .single();
+    if (error) {
+      // unique violation em crm_equipe_email_idx
+      if (error.code === "23505") return res.status(409).json({ error: "Já existe alguém da equipe com esse email" });
+      return res.status(500).json({ error: error.message });
+    }
+    res.json({ pessoa: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch("/api/admin/equipe/:id", async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  if (!requireRole(req, res, ["administrador"])) return;
+  try {
+    const { nome, role, ativo, senha } = req.body || {};
+    const ROLES_VALIDAS = ["administrador", "gerente", "vendedor", "atendimento", "operacao"];
+    const updates = {};
+    if (nome !== undefined) updates.nome = nome;
+    if (role !== undefined) {
+      if (!ROLES_VALIDAS.includes(role)) return res.status(400).json({ error: "Role inválido" });
+      updates.role = role;
+    }
+    if (ativo !== undefined) updates.ativo = !!ativo;
+    if (senha) {
+      if (senha.length < 8) return res.status(400).json({ error: "Senha precisa ter pelo menos 8 caracteres" });
+      updates.senha_hash = await bcrypt.hash(senha, 10);
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: "Nada para atualizar" });
+    const { data, error } = await supabase
+      .from("crm_equipe")
+      .update(updates)
+      .eq("id", req.params.id)
+      .select("id,nome,email,role,ativo,created_at")
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: "Pessoa não encontrada" });
+    res.json({ pessoa: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ADMIN STATS ────────────────────────────────────────────
