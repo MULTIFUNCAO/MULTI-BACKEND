@@ -20,8 +20,11 @@ const app = express();
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   process.env.ADMIN_FRONTEND_URL,
-  "https://multi-crm.vercel.app",
-  "https://multi-crm-anacristinal1401-2650s-projects.vercel.app",
+  // Alias real de produção do projeto Vercel "multi-crm" (confirmado
+  // 2026-08-31 — o alias team-scoped previsível não ficou disponível,
+  // Vercel atribuiu um nome aleatório em vez disso; os dois "adivinhados"
+  // que estavam aqui antes nunca resolviam, deu 302/307 em teste real).
+  "https://multi-crm-ochre.vercel.app",
   "https://localhost", "capacitor://localhost", "http://localhost",
 ].filter(Boolean);
 // Aceita também a variante com/sem "www." de FRONTEND_URL. Achado
