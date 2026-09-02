@@ -1366,6 +1366,48 @@ async function resolverValorAcesso(titularTipo, titularEmail) {
   };
 }
 
+// ── CORREÇÃO DO MODELO FINANCEIRO (MULTI-CRM, handoff 2026-09-01) ───────────
+// Duas funções síncronas (sem round-trip ao banco por linha — recebem
+// "assinatura" e "configMonetizacao" já carregados) pra classificar/precificar
+// uma linha de "assinaturas" sem duplicar a lógica ad-hoc que já existia
+// (idêntica, em espírito, à usada em /api/admin/professionals — reaproveitada
+// aqui em vez de reinventada, mesma classificação usada nos dois lugares).
+//
+// "status='ativa'" sozinho NÃO prova pagamento real neste banco (achado
+// 2026-08-13: linhas gravadas direto via SQL/teste, sem passar por
+// ativarAssinatura(), pulam a confirmação Asaas) — só conta como 'pago'
+// quem tem asaas_customer_id OU cortesia explícita, e não está com a
+// cobrança atual vencida.
+function statusPagamentoAssinatura(assinatura) {
+  if (!assinatura) return "sem_plano";
+  const proximaCobranca = assinatura.proxima_cobranca ? new Date(assinatura.proxima_cobranca).getTime() : null;
+  const temVinculoReal = !!assinatura.asaas_customer_id || !!assinatura.cortesia;
+  if (assinatura.status === "cancelada") return "cancelado";
+  if (assinatura.status === "inadimplente") return "vencido";
+  if (assinatura.status === "ativa" || assinatura.status === "trial") {
+    if (!temVinculoReal) return "sem_confirmacao";
+    return (proximaCobranca && proximaCobranca < Date.now()) ? "vencido" : "pago";
+  }
+  return "cancelado"; // status desconhecido/futuro — fail-safe, não conta como pago
+}
+
+// Valor real da mensalidade ATUAL de uma assinatura — fixo pros planos
+// legados (PLANOS_ASSINATURA), calculado (promo vs pós-promo) só pra
+// "acesso", mesma fórmula de resolverValorAcesso()/ciclo_financeiro, sem
+// bater no banco de novo (config já vem carregada de fora).
+function valorMensalidadeAtual(assinatura, configMonetizacao) {
+  if (assinatura.plano === "acesso") {
+    if (!configMonetizacao) return 0;
+    const entradaEm = assinatura.taxa_acesso_entrada_em;
+    if (!entradaEm) return Number(configMonetizacao.valor_entrada);
+    const fimPromocao = new Date(entradaEm);
+    fimPromocao.setMonth(fimPromocao.getMonth() + configMonetizacao.duracao_promocao_meses);
+    const dentroDaPromocao = Date.now() < fimPromocao.getTime();
+    return Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao);
+  }
+  return Number(PLANOS_ASSINATURA[assinatura.plano]?.valor || 0);
+}
+
 // ── CUPONS (mês grátis pra quem divulga a plataforma) ───────────────────────
 // Reutilizável de propósito (mesmo código serve pra N profissionais) — ver
 // supabase_cupons_migration.sql. Só vale pro Multi Autônomo, checado tanto
@@ -2501,13 +2543,31 @@ app.get("/api/admin/stats", async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { data: usuarios } = await supabase.from("usuarios").select("role,created_at");
-    const { data: assinaturas } = await supabase.from("assinaturas").select("status").eq("status", "ativa");
     const pros = usuarios?.filter(u => u.role === "professional") || [];
     const clients = usuarios?.filter(u => u.role === "client") || [];
-    const proAtivos = assinaturas?.length || 0;
     const hoje = new Date().toISOString().split("T")[0];
     const novosHoje = usuarios?.filter(u => u.created_at?.startsWith(hoje)) || [];
-    const mrr = proAtivos * 29.90;
+
+    // Correção do modelo financeiro (handoff MULTI-CRM, 2026-09-01): "mrr"
+    // era proAtivos*29.90 fixo — misturava 6 planos com preços diferentes
+    // (Autônomo 29,90 / Pro 59,90 / Premium 129,90 / Empresa 149,90 / Empresa
+    // Plus 299,90 / Acesso 9,90-29,90 conforme promoção) num preço único, e
+    // contava "status='ativa'" como pago mesmo pra linhas de teste gravadas
+    // direto via SQL (nunca confirmadas na Asaas). Agora soma o valor real
+    // por assinatura, só de quem tem paymentStatus 'pago' de verdade — mesmo
+    // critério de /api/admin/professionals (asaas_customer_id/cortesia +
+    // não vencida), não um segundo critério divergente. Inclui titular_tipo
+    // 'usuario' E 'empresa' (empresa também é receita recorrente real
+    // confirmada pelo mesmo webhook Asaas — decisão explícita do handoff,
+    // não excluir).
+    const [{ data: assinaturasCompletas }, { data: configMonetizacaoStats }] = await Promise.all([
+      supabase.from("assinaturas")
+        .select("titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em"),
+      supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle(),
+    ]);
+    const assinaturasPagas = (assinaturasCompletas || []).filter(a => statusPagamentoAssinatura(a) === "pago");
+    const proAtivos = assinaturasPagas.length;
+    const mrr = assinaturasPagas.reduce((s, a) => s + valorMensalidadeAtual(a, configMonetizacaoStats), 0);
 
     // Fase 2 do MULTI-CRM (dashboard), ver memória do projeto. "valorMovimentado"
     // usa a MESMA definição já usada em /api/admin/clientes e
@@ -2952,6 +3012,42 @@ app.get('/api/admin/oportunidades', async (req, res) => {
     const semProposta = resumoTipo('sem_proposta');
     const propostaSemResposta = resumoTipo('proposta_sem_resposta');
     const paradoPosAceite = resumoTipo('parado_pos_aceite');
+    const dinheiroNaMesaServico = semProposta.valor + propostaSemResposta.valor + paradoPosAceite.valor;
+
+    // Correção do modelo financeiro (handoff MULTI-CRM, 2026-09-01):
+    // "Dinheiro na Mesa" baseado em comissão de serviço só faz sentido com o
+    // modelo de comissão ligado (config_monetizacao.comissao_ativa) — hoje
+    // está desligado (monetização é por mensalidade de profissional), então
+    // esse número não é receita real e confundia a leitura do painel.
+    // Redefinido pra somar o valor de MENSALIDADE potencial de profissionais
+    // que se cadastraram (mesmo universo de /api/admin/professionals: role
+    // 'professional' OU autonomia_aceita_em preenchido) mas nunca tiveram
+    // pagamento confirmado (paymentStatus 'sem_plano' ou 'sem_confirmacao' —
+    // mesma classificação de statusPagamentoAssinatura, não uma nova). Não
+    // conta 'vencido' (já pagou antes, é cobrança em atraso — problema
+    // diferente, de cobrança/retenção, não de "nunca fechou") nem
+    // 'cancelado'. flag comissao_ativa já existe em config_monetizacao —
+    // quando virar true, o front volta a mostrar o card de serviço sozinho,
+    // sem precisar reescrever nada aqui.
+    const { data: prosUsuarios } = await supabase
+      .from('usuarios').select('email')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    const prosEmails = (prosUsuarios || []).map(p => p.email).filter(Boolean);
+    const [{ data: assinaturasPros }, { data: configMonetizacaoOp }] = await Promise.all([
+      prosEmails.length
+        ? supabase.from('assinaturas')
+            .select('titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em')
+            .eq('titular_tipo', 'usuario').in('titular_email', prosEmails)
+        : Promise.resolve({ data: [] }),
+      supabase.from('config_monetizacao').select('comissao_ativa,valor_entrada').eq('id', 1).maybeSingle(),
+    ]);
+    const assinaturaPorEmailPro = Object.fromEntries((assinaturasPros || []).map(a => [a.titular_email, a]));
+    const semPagamentoConfirmado = prosEmails.filter(email => {
+      const st = statusPagamentoAssinatura(assinaturaPorEmailPro[email]);
+      return st === 'sem_plano' || st === 'sem_confirmacao';
+    });
+    const dinheiroNaMesaMensalidade = semPagamentoConfirmado.length * Number(configMonetizacaoOp?.valor_entrada || 0);
+    const comissaoAtiva = !!configMonetizacaoOp?.comissao_ativa;
 
     res.json({
       resumo: {
@@ -2959,7 +3055,16 @@ app.get('/api/admin/oportunidades', async (req, res) => {
         proposta_sem_resposta: propostaSemResposta,
         parado_pos_aceite: paradoPosAceite,
         clientes_reativaveis: { count: reativaveis.length },
-        dinheiro_na_mesa: semProposta.valor + propostaSemResposta.valor + paradoPosAceite.valor,
+        // "dinheiro_na_mesa" continua existindo (compat com quem já lê esse
+        // campo) mas agora escolhe sozinho qual dos dois números é o real,
+        // conforme o modelo de cobrança ativo — "_modo" é pro front trocar
+        // o texto/label do card sem precisar adivinhar pelo valor.
+        dinheiro_na_mesa: comissaoAtiva ? dinheiroNaMesaServico : dinheiroNaMesaMensalidade,
+        dinheiro_na_mesa_modo: comissaoAtiva ? "servico" : "mensalidade",
+        dinheiro_na_mesa_servico: dinheiroNaMesaServico,
+        dinheiro_na_mesa_mensalidade: dinheiroNaMesaMensalidade,
+        dinheiro_na_mesa_mensalidade_qtd: semPagamentoConfirmado.length,
+        comissao_ativa: comissaoAtiva,
       },
       itens,
       reativaveis,
