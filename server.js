@@ -4609,6 +4609,58 @@ app.get('/api/admin/funil-conversao-profissional', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — MARKETING: DISPARO DE REENGAJAMENTO (MULTI-CRM, handoff        ──
+// 2026-09-02, item 5) ────────────────────────────────────────────────────
+// Handoff pedia "Painel de campanhas com Facebook Ads, custo por lead,
+// rastreio de origem até conversão, templates de mensagem por estágio" —
+// tudo isso continua bloqueado (não existe rastreamento de UTM/campanha
+// nem integração com plataforma de anúncio hoje — pedidos.origem só
+// distingue real/demo/suporte, não é dado de marketing; mesmo motivo já
+// documentado em EM_CONSTRUCAO.marketing do MULTI-CRM). Só a parte que
+// tinha canal real por trás foi construída: disparo de reengajamento pro
+// painel "Não Fecharam" (clientes status_engajamento='sem_solicitacao',
+// já existe desde a Fase 1/3 do CRM em /api/admin/clientes) — via push
+// OneSignal (mesmo mecanismo já usado nos lembretes de pedido), não
+// WhatsApp (esse segue travado em decisão de provedor, ver Inbox.jsx).
+// Sem template fixo de propósito — "templates por estágio" é a parte que
+// segue não construída; aqui o admin escreve a mensagem na hora.
+app.post('/api/admin/marketing/reengajamento', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { emails, mensagem } = req.body || {};
+    if (!Array.isArray(emails) || !emails.length) return res.status(400).json({ error: 'emails (array) é obrigatório' });
+    if (!mensagem || !String(mensagem).trim()) return res.status(400).json({ error: 'mensagem é obrigatória' });
+
+    const { data: usuarios } = await supabase.from('usuarios').select('email,onesignal_player_id').in('email', emails);
+    const comPush = (usuarios || []).filter(u => u.onesignal_player_id);
+    const semPush = emails.filter(e => !comPush.some(u => u.email === e));
+    const playerIds = [...new Set(comPush.map(u => u.onesignal_player_id))];
+
+    if (!playerIds.length) {
+      // Não é erro de servidor — é um resultado real e esperado (ninguém
+      // da lista tem push habilitado). Devolve 200 com o detalhe, não 500;
+      // quem chama decide o que fazer com isso.
+      return res.json({ enviados: 0, sem_push: semPush });
+    }
+
+    const r = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.ONESIGNAL_API_KEY },
+      body: JSON.stringify({
+        app_id: process.env.ONESIGNAL_APP_ID,
+        include_player_ids: playerIds,
+        headings: { pt: 'Multi' },
+        contents: { pt: String(mensagem).trim() },
+      }),
+    });
+    const oneSignalResp = await r.json();
+    if (!r.ok) return res.status(502).json({ error: oneSignalResp?.errors?.[0] || 'Erro ao enviar via OneSignal' });
+
+    log('MARKETING REENGAJAMENTO', { totalSelecionados: emails.length, enviados: playerIds.length, semPush: semPush.length });
+    res.json({ enviados: playerIds.length, sem_push: semPush });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
 // Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
 // existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
