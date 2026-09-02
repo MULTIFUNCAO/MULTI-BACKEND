@@ -3046,7 +3046,7 @@ app.get('/api/admin/oportunidades', async (req, res) => {
       const st = statusPagamentoAssinatura(assinaturaPorEmailPro[email]);
       return st === 'sem_plano' || st === 'sem_confirmacao';
     });
-    const dinheiroNaMesaMensalidade = semPagamentoConfirmado.length * Number(configMonetizacaoOp?.valor_entrada || 0);
+    const dinheiroNaMesaMensalidade = Math.round(semPagamentoConfirmado.length * Number(configMonetizacaoOp?.valor_entrada || 0) * 100) / 100;
     const comissaoAtiva = !!configMonetizacaoOp?.comissao_ativa;
 
     res.json({
