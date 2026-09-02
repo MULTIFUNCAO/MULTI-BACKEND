@@ -4104,6 +4104,12 @@ app.post('/api/admin/demandas-suporte', async (req, res) => {
       categoria: body.categoria,
       descricao: body.descricao.trim(),
       valor: (body.valor === '' || body.valor == null) ? null : Number(body.valor),
+      // Mesmos 3 valores que PostServiceScreen grava pro cadastro normal do
+      // cliente (App.jsx) — sem isso o badge/filtro "🔥 Urgente" do mural
+      // nunca acendia pra demanda MULTI-SUP (campo nem existia aqui antes,
+      // achado 2026-09-02). Valor fora da lista cai em 'normal' em vez de
+      // gravar lixo na coluna.
+      urgencia: ['normal', 'urgente', 'muito_urgente'].includes(body.urgencia) ? body.urgencia : 'normal',
       cidade: body.cidade.trim(),
       bairro: body.bairro ? body.bairro.trim() : null,
       endereco: body.endereco ? body.endereco.trim() : null,
