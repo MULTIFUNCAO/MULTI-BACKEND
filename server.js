@@ -4811,6 +4811,119 @@ app.get('/api/admin/ranking-categorias', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — INTELIGÊNCIA MULTI (MULTI-CRM, handoff 2026-09-02, item 5) ──────
+// Módulo que dependia de Vendas/Marketing existirem (EM_CONSTRUCAO.inteligencia
+// original) — ambos já existem agora. "Resumo diário" NÃO é um resumo
+// gerado por IA/LLM (não existe isso aqui) — é a mesma central de alertas
+// já usada no sino do Header (useAlerts.js/oportunidades) + 2 sinais de
+// padrão NOVOS pedidos pelo handoff, que essa rota calcula. "Score de
+// risco de churn" é uma heurística simples baseada em regras conhecidas do
+// negócio, não é modelo de machine learning — cada fator do score é
+// explícito e visível, não é caixa preta.
+app.get('/api/admin/alertas-padrao', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const LIMITE_DIAS_APROVACAO = 3;
+    const LIMITE_DIAS_SEM_SERVICO = 30;
+    const agora = Date.now();
+    const diasDesde = (iso) => iso ? Math.floor((agora - new Date(iso).getTime()) / 86400000) : null;
+
+    const { data: pros, error } = await supabase
+      .from('usuarios')
+      .select('email,name,approved,autonomia_aceita_em')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Sinal 1: aprovação parada — aceitou o termo de autonomia (entrou no
+    // fluxo profissional de verdade) há mais de N dias e continua sem
+    // approved=true.
+    const aprovacaoParada = (pros || [])
+      .filter(p => !p.approved && p.autonomia_aceita_em && diasDesde(p.autonomia_aceita_em) >= LIMITE_DIAS_APROVACAO)
+      .map(p => ({ email: p.email, nome: p.name, dias_esperando: diasDesde(p.autonomia_aceita_em) }))
+      .sort((a, b) => b.dias_esperando - a.dias_esperando);
+
+    // Sinal 2: pagante sem nenhum serviço aceito há mais de N dias desde o
+    // início do plano — mesmo critério de pagamento de sempre
+    // (statusPagamentoAssinatura). "Sem serviço aceito" = nunca apareceu
+    // como pedidos.profissional_aceito, não é "sem serviço recente" (não
+    // temos data de última atividade além de pedido aceito).
+    const emails = (pros || []).map(p => p.email);
+    const [{ data: assinaturas }, { data: pedidosAceitos }] = await Promise.all([
+      emails.length ? supabase.from('assinaturas').select('titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,inicio').eq('titular_tipo', 'usuario').in('titular_email', emails) : Promise.resolve({ data: [] }),
+      emails.length ? supabase.from('pedidos').select('profissional_aceito').in('profissional_aceito', emails).neq('origem', 'demo') : Promise.resolve({ data: [] }),
+    ]);
+    const assinaturaPorEmail = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+    const temServico = new Set((pedidosAceitos || []).map(p => p.profissional_aceito));
+
+    const pagante_sem_servico = (pros || [])
+      .filter(p => {
+        const a = assinaturaPorEmail[p.email];
+        if (!a || statusPagamentoAssinatura(a) !== 'pago') return false;
+        if (temServico.has(p.email)) return false;
+        return diasDesde(a.inicio) >= LIMITE_DIAS_SEM_SERVICO;
+      })
+      .map(p => ({ email: p.email, nome: p.name, dias_pagante: diasDesde(assinaturaPorEmail[p.email].inicio) }))
+      .sort((a, b) => b.dias_pagante - a.dias_pagante);
+
+    res.json({
+      aprovacao_parada: { count: aprovacaoParada.length, itens: aprovacaoParada, limite_dias: LIMITE_DIAS_APROVACAO },
+      pagante_sem_servico: { count: pagante_sem_servico.length, itens: pagante_sem_servico, limite_dias: LIMITE_DIAS_SEM_SERVICO },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Score de risco de cancelamento (churn) — heurística de regras, NÃO é
+// machine learning nem previsão estatística de verdade (não existe
+// histórico de cancelamento suficiente pra treinar nada). Cada fator soma
+// pontos de forma transparente (devolvidos junto na resposta), classificado
+// em baixo/médio/alto. Só considera quem já é ou já foi pagante ('pago' ou
+// 'vencido') — quem nunca pagou não tem "risco de cancelamento" pra medir.
+app.get('/api/admin/score-churn', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const agora = Date.now();
+    const diasDesde = (iso) => iso ? Math.floor((agora - new Date(iso).getTime()) / 86400000) : null;
+
+    const { data: pros, error } = await supabase
+      .from('usuarios').select('email,name')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (error) return res.status(500).json({ error: error.message });
+    const emails = (pros || []).map(p => p.email);
+    const [{ data: assinaturas }, { data: pedidosAceitos }] = await Promise.all([
+      emails.length ? supabase.from('assinaturas').select('titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,inicio').eq('titular_tipo', 'usuario').in('titular_email', emails) : Promise.resolve({ data: [] }),
+      emails.length ? supabase.from('pedidos').select('profissional_aceito,created_at').in('profissional_aceito', emails).neq('origem', 'demo') : Promise.resolve({ data: [] }),
+    ]);
+    const assinaturaPorEmail = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+    const ultimoServicoPorEmail = {};
+    (pedidosAceitos || []).forEach(p => {
+      const atual = ultimoServicoPorEmail[p.profissional_aceito];
+      if (!atual || new Date(p.created_at) > new Date(atual)) ultimoServicoPorEmail[p.profissional_aceito] = p.created_at;
+    });
+
+    const scores = [];
+    (pros || []).forEach(p => {
+      const a = assinaturaPorEmail[p.email];
+      const status = statusPagamentoAssinatura(a);
+      if (status !== 'pago' && status !== 'vencido') return; // nunca pagou, não entra
+      const fatores = [];
+      let pontos = 0;
+      if (status === 'vencido') { pontos += 40; fatores.push('Pagamento vencido (+40)'); }
+      const ultimoServico = ultimoServicoPorEmail[p.email];
+      const diasSemServico = ultimoServico ? diasDesde(ultimoServico) : diasDesde(a.inicio);
+      if (!ultimoServico) {
+        if (diasSemServico >= 30) { pontos += 30; fatores.push(`Nunca aceitou serviço, pagante há ${diasSemServico}d (+30)`); }
+      } else if (diasSemServico >= 60) { pontos += 30; fatores.push(`${diasSemServico}d sem aceitar serviço (+30)`); }
+      else if (diasSemServico >= 30) { pontos += 15; fatores.push(`${diasSemServico}d sem aceitar serviço (+15)`); }
+      pontos = Math.min(100, pontos);
+      const nivel = pontos >= 60 ? 'alto' : pontos >= 30 ? 'medio' : 'baixo';
+      scores.push({ email: p.email, nome: p.name, score: pontos, nivel, fatores, status_pagamento: status });
+    });
+    scores.sort((a, b) => b.score - a.score);
+
+    res.json({ profissionais: scores, metodologia: "Heurística de regras (não é machine learning): +40 pagamento vencido, +15 a +30 conforme dias sem aceitar nenhum serviço. Cada fator aparece explícito por profissional." });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
 // Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
 // existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
