@@ -4587,14 +4587,25 @@ app.get('/api/admin/funil-conversao-profissional', async (req, res) => {
       { etapa: 'aprovado', label: 'Aprovado', count: aprovado.length },
       { etapa: 'pagando', label: 'Pagando', count: pagando.length },
     ];
-    // Taxa de perda calculada sempre contra a etapa ANTERIOR (não contra o
-    // topo) — é a leitura padrão de funil ("de quem chegou aqui, quantos
-    // não passaram pra próxima"), primeira etapa não tem perda (é o 100%).
-    const comPerda = etapas.map((e, i) => ({
+    // Achado testando ao vivo (2026-09-02): "aprovado" pode ser MAIOR que
+    // "documento_enviado" (documento e aprovação não são um funil
+    // estritamente sequencial nesse negócio — tem conta aprovada sem
+    // doc_rg_url registrado, provavelmente aprovações antigas de antes do
+    // upload de documento existir, ou o bug de durabilidade já documentado
+    // limpando a coluna) e pagamento (Taxa de Acesso) também não depende de
+    // aprovação acontecer primeiro — são processos paralelos, não uma
+    // esteira única. "Taxa de perda vs. etapa anterior" dava número
+    // negativo (sem sentido) nesse caso real. Em vez de fingir uma
+    // sequência estrita que não existe, cada etapa mostra % do TOPO do
+    // funil (cadastro_iniciado), não da etapa anterior — sempre ≥0, sempre
+    // correto, só não implica dependência entre etapas que não existe de
+    // verdade.
+    const topo = etapas[0].count;
+    const comPercentual = etapas.map((e, i) => ({
       ...e,
-      taxa_perda_pct: i === 0 || etapas[i - 1].count === 0 ? null : Math.round((1 - e.count / etapas[i - 1].count) * 1000) / 10,
+      pct_do_topo: i === 0 || topo === 0 ? null : Math.round((e.count / topo) * 1000) / 10,
     }));
-    res.json({ etapas: comPerda });
+    res.json({ etapas: comPercentual });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
