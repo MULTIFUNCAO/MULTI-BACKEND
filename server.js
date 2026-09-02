@@ -4146,6 +4146,78 @@ app.post('/api/admin/demandas-suporte', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — INTERESSES MULTI-SUP (intermediação manual) ─────────────────
+// Decisão 2026-09-02 (revertendo uma tentativa anterior de abrir WhatsApp
+// direto pro cliente): demanda MULTI-SUP não tem cliente com conta no app
+// nem telefone exposto pro profissional — "Tenho Interesse" só grava uma
+// "proposta" normal (mesma tabela usada por qualquer pedido real) e mostra
+// um toast avisando que a equipe vai ligar. Esse endpoint é a lista que o
+// Admin (Thiago/Ana) usa pra ver quem demonstrou interesse em qual demanda
+// e ligar por fora do app — sem isso o interesse ficava só na tabela
+// "propostas", sem nenhuma tela mostrando.
+app.get('/api/admin/interesses-multi-sup', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: demandas, error: errDemandas } = await supabase.from('pedidos')
+      .select('id,codigo_interno,categoria,descricao,cidade,valor,status')
+      .eq('origem', 'suporte');
+    if (errDemandas) return res.status(500).json({ error: errDemandas.message });
+    const idsSuporte = (demandas || []).map(d => d.id);
+    if (!idsSuporte.length) return res.json({ interesses: [] });
+    const pedidoPorId = Object.fromEntries(demandas.map(d => [d.id, d]));
+
+    const { data: propostas, error: errPropostas } = await supabase.from('propostas')
+      .select('id,pedido_id,profissional_nome,profissional_email,status,created_at')
+      .in('pedido_id', idsSuporte).order('created_at', { ascending: false });
+    if (errPropostas) return res.status(500).json({ error: errPropostas.message });
+
+    // Telefone do PROFISSIONAL (não do cliente — esse continua nunca
+    // exposto) pra equipe ligar de volta, ver usuarios.whatsapp.
+    const emailsProfissional = [...new Set((propostas || []).map(p => p.profissional_email).filter(Boolean))];
+    const { data: profs } = emailsProfissional.length
+      ? await supabase.from('usuarios').select('email,whatsapp').in('email', emailsProfissional)
+      : { data: [] };
+    const whatsappPorEmail = Object.fromEntries((profs || []).map(p => [p.email, p.whatsapp]));
+
+    const interesses = (propostas || []).map(p => {
+      const pedido = pedidoPorId[p.pedido_id] || {};
+      return {
+        id: p.id,
+        pedidoId: p.pedido_id,
+        codigoInterno: pedido.codigo_interno || null,
+        categoria: pedido.categoria || null,
+        descricao: pedido.descricao || null,
+        cidade: pedido.cidade || null,
+        valor: pedido.valor ?? null,
+        demandaStatus: pedido.status || null,
+        profissionalNome: p.profissional_nome,
+        profissionalEmail: p.profissional_email,
+        profissionalWhatsapp: whatsappPorEmail[p.profissional_email] || null,
+        status: p.status,
+        criadoEm: p.created_at,
+      };
+    });
+    res.json({ interesses });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Marca que a equipe já ligou/resolveu esse interesse — reaproveita o
+// mesmo enum de status que "propostas" já usa em todo o resto do app
+// (pendente/aceita/recusada), sem precisar de valor novo: "aceita" aqui
+// significa "conectamos profissional e cliente", "recusada" significa
+// "não deu certo/não vamos seguir com esse profissional pra essa demanda".
+app.post('/api/admin/interesses-multi-sup/:id/status', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { status } = req.body || {};
+    if (!['aceita', 'recusada', 'pendente'].includes(status)) return res.status(400).json({ error: 'status inválido' });
+    const { data, error } = await supabase.from('propostas').update({ status }).eq('id', req.params.id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Interesse não encontrado' });
+    res.json({ proposta: data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — MÓDULO DE SUPORTE (MULTI-CRM, handoff 2026-09-02, item 2) ───────
 // "Ticket de problema de profissional" — SEM relação com "demandas-suporte"
 // acima (aquilo é pedido de serviço criado em nome de um cliente, tabela
@@ -4308,6 +4380,84 @@ app.delete('/api/admin/vendas-pipeline/:id', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { error } = await supabase.from('vendas_pipeline').delete().eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — DEMANDAS PESSOAIS (MULTI-CRM, handoff 2026-09-02, item 4) ───────
+// Apesar do nome (mantido por decisão do Thiago), NÃO tem relação com
+// "pedidos"/demanda de serviço do marketplace nem com "demandas-suporte"
+// (MULTI-SUP). É lista de tarefas pessoal — cada rota filtra sempre por
+// dono_id = req.adminAuth.userId, nunca devolve tarefa de outra pessoa.
+// Exige login por pessoa (crm_equipe) — o token antigo (senha única) não
+// carrega userId, então não dá pra saber de quem é a lista; 400 explícito
+// em vez de vazar/inventar um dono.
+function exigirUsuarioLogado(req, res) {
+  if (!req.adminAuth?.userId) {
+    res.status(400).json({ error: 'Esta tela exige login por pessoa (crm_equipe) — o token antigo não tem um dono pra associar as tarefas.' });
+    return null;
+  }
+  return req.adminAuth.userId;
+}
+
+app.get('/api/admin/demandas-pessoais', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const donoId = exigirUsuarioLogado(req, res);
+  if (!donoId) return;
+  try {
+    const { data, error } = await supabase.from('demandas_pessoais').select('*').eq('dono_id', donoId).order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demandas: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/demandas-pessoais', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const donoId = exigirUsuarioLogado(req, res);
+  if (!donoId) return;
+  try {
+    const { texto, prazo } = req.body || {};
+    if (!texto || !String(texto).trim()) return res.status(400).json({ error: 'texto é obrigatório' });
+    const { data, error } = await supabase.from('demandas_pessoais')
+      .insert({ dono_id: donoId, texto: texto.trim(), prazo: prazo || null })
+      .select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demanda: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/demandas-pessoais/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const donoId = exigirUsuarioLogado(req, res);
+  if (!donoId) return;
+  try {
+    const { texto, prazo, concluida } = req.body || {};
+    const updates = {};
+    if (texto !== undefined) updates.texto = String(texto).trim();
+    if (prazo !== undefined) updates.prazo = prazo || null;
+    if (concluida !== undefined) {
+      updates.concluida = !!concluida;
+      updates.concluida_em = concluida ? new Date().toISOString() : null;
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: 'Nada para atualizar' });
+    // .eq('dono_id', donoId) além do id — não só por segurança (RLS já
+    // nega tudo pra anon/authenticated de qualquer forma, service_role
+    // ignora RLS), mas pra garantir que ninguém edite tarefa de outra
+    // pessoa mesmo sabendo o id de propósito ou por acidente.
+    const { data, error } = await supabase.from('demandas_pessoais').update(updates).eq('id', req.params.id).eq('dono_id', donoId).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Tarefa não encontrada' });
+    res.json({ demanda: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/demandas-pessoais/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const donoId = exigirUsuarioLogado(req, res);
+  if (!donoId) return;
+  try {
+    const { error } = await supabase.from('demandas_pessoais').delete().eq('id', req.params.id).eq('dono_id', donoId);
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
