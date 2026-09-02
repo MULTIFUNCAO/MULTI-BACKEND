@@ -4463,6 +4463,141 @@ app.delete('/api/admin/demandas-pessoais/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — RELATÓRIOS (MULTI-CRM, handoff 2026-09-02, item 5) ──────────────
+// Escopo decidido com o usuário: só Exportação CSV + Funil de conversão do
+// profissional aqui. Conciliação Asaas×extrato bancário de verdade fica de
+// fora — é projeto à parte (precisa upload de extrato, sem integração
+// bancária hoje); o que já existe nessa linha é /api/admin/reconciliacao-
+// assinaturas (Asaas×Supabase, não Asaas×banco).
+
+// CSV simples, RFC 4180 o suficiente pro Excel abrir sem drama: aspas
+// duplicadas escapam aspas, campo só ganha aspas se tiver vírgula/aspas/
+// quebra de linha. ﻿ (BOM) na frente pro Excel não confundir acento
+// com encoding errado (gotcha clássico de CSV UTF-8 no Windows).
+function paraCSV(linhas, colunas) {
+  const escapar = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const header = colunas.map(c => escapar(c.titulo)).join(',');
+  const corpo = linhas.map(linha => colunas.map(c => escapar(c.valor(linha))).join(',')).join('\n');
+  return '﻿' + header + '\n' + corpo;
+}
+function enviarCSV(res, nomeArquivo, csv) {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${nomeArquivo}"`);
+  res.send(csv);
+}
+
+app.get('/api/admin/export/clientes', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from('usuarios').select('email,name,whatsapp,city,created_at').eq('role', 'client').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const csv = paraCSV(data || [], [
+      { titulo: 'Nome', valor: r => r.name },
+      { titulo: 'E-mail', valor: r => r.email },
+      { titulo: 'WhatsApp', valor: r => r.whatsapp },
+      { titulo: 'Cidade', valor: r => r.city },
+      { titulo: 'Cadastro', valor: r => r.created_at ? new Date(r.created_at).toLocaleDateString('pt-BR') : '' },
+    ]);
+    enviarCSV(res, 'clientes.csv', csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/export/profissionais', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pros, error } = await supabase
+      .from('usuarios')
+      .select('email,name,whatsapp,city,categoria_servico,approved,role,created_at')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const emails = (pros || []).map(p => p.email);
+    const { data: assinaturas } = emails.length
+      ? await supabase.from('assinaturas').select('titular_email,plano,status,asaas_customer_id,cortesia,proxima_cobranca,taxa_acesso_entrada_em').eq('titular_tipo', 'usuario').in('titular_email', emails)
+      : { data: [] };
+    const assinaturaPorEmail = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+    const csv = paraCSV(pros || [], [
+      { titulo: 'Nome', valor: r => r.name },
+      { titulo: 'E-mail', valor: r => r.email },
+      { titulo: 'WhatsApp', valor: r => r.whatsapp },
+      { titulo: 'Cidade', valor: r => r.city },
+      { titulo: 'Categorias', valor: r => (r.categoria_servico || []).join('; ') },
+      { titulo: 'Aprovado', valor: r => r.approved ? 'Sim' : 'Não' },
+      { titulo: 'Plano', valor: r => assinaturaPorEmail[r.email]?.plano || '' },
+      { titulo: 'Status pagamento', valor: r => statusPagamentoAssinatura(assinaturaPorEmail[r.email]) },
+      { titulo: 'Cadastro', valor: r => r.created_at ? new Date(r.created_at).toLocaleDateString('pt-BR') : '' },
+    ]);
+    enviarCSV(res, 'profissionais.csv', csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/export/financeiro', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const [{ data: assinaturas }, { data: configMonetizacao }] = await Promise.all([
+      supabase.from('assinaturas').select('titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,inicio'),
+      supabase.from('config_monetizacao').select('*').eq('id', 1).maybeSingle(),
+    ]);
+    const csv = paraCSV(assinaturas || [], [
+      { titulo: 'Tipo', valor: r => r.titular_tipo },
+      { titulo: 'E-mail', valor: r => r.titular_email },
+      { titulo: 'Plano', valor: r => r.plano },
+      { titulo: 'Status pagamento', valor: r => statusPagamentoAssinatura(r) },
+      { titulo: 'Valor atual', valor: r => valorMensalidadeAtual(r, configMonetizacao).toFixed(2) },
+      { titulo: 'Início', valor: r => r.inicio ? new Date(r.inicio).toLocaleDateString('pt-BR') : '' },
+      { titulo: 'Próxima cobrança', valor: r => r.proxima_cobranca ? new Date(r.proxima_cobranca).toLocaleDateString('pt-BR') : '' },
+      { titulo: 'Cortesia', valor: r => r.cortesia ? 'Sim' : 'Não' },
+    ]);
+    enviarCSV(res, 'financeiro.csv', csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Funil de CONVERSÃO DO PROFISSIONAL (cadastro → pagante) — não confundir
+// com /api/admin/funil (esse é sobre ciclo de vida de PEDIDO, coisa
+// diferente). 4 etapas com dado real que já existe, sem inventar evento
+// nenhum: cadastro iniciado (autonomia_aceita_em, mesmo sinal usado em todo
+// o resto do painel pra "entrou no fluxo profissional") → documento
+// enviado (doc_rg_url) → aprovado (approved) → pagando (paymentStatus via
+// statusPagamentoAssinatura, mesma classificação de sempre).
+app.get('/api/admin/funil-conversao-profissional', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pros, error } = await supabase
+      .from('usuarios')
+      .select('email,approved,doc_rg_url')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (error) return res.status(500).json({ error: error.message });
+    const emails = (pros || []).map(p => p.email);
+    const { data: assinaturas } = emails.length
+      ? await supabase.from('assinaturas').select('titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em').eq('titular_tipo', 'usuario').in('titular_email', emails)
+      : { data: [] };
+    const assinaturaPorEmail = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+
+    const cadastroIniciado = pros || [];
+    const documentoEnviado = cadastroIniciado.filter(p => p.doc_rg_url);
+    const aprovado = cadastroIniciado.filter(p => p.approved);
+    const pagando = cadastroIniciado.filter(p => statusPagamentoAssinatura(assinaturaPorEmail[p.email]) === 'pago');
+
+    const etapas = [
+      { etapa: 'cadastro_iniciado', label: 'Cadastro iniciado', count: cadastroIniciado.length },
+      { etapa: 'documento_enviado', label: 'Documento enviado', count: documentoEnviado.length },
+      { etapa: 'aprovado', label: 'Aprovado', count: aprovado.length },
+      { etapa: 'pagando', label: 'Pagando', count: pagando.length },
+    ];
+    // Taxa de perda calculada sempre contra a etapa ANTERIOR (não contra o
+    // topo) — é a leitura padrão de funil ("de quem chegou aqui, quantos
+    // não passaram pra próxima"), primeira etapa não tem perda (é o 100%).
+    const comPerda = etapas.map((e, i) => ({
+      ...e,
+      taxa_perda_pct: i === 0 || etapas[i - 1].count === 0 ? null : Math.round((1 - e.count / etapas[i - 1].count) * 1000) / 10,
+    }));
+    res.json({ etapas: comPerda });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
 // Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
 // existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
