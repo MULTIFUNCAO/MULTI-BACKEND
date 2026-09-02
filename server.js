@@ -4233,6 +4233,86 @@ app.patch('/api/admin/suporte-tickets/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — VENDAS: PIPELINE DE PROFISSIONAIS (MULTI-CRM, handoff        ──
+// 2026-09-02, item 3) ───────────────────────────────────────────────────
+// Opt-in: a equipe adiciona manualmente quem está sendo trabalhado de
+// verdade — não confundir com "Dinheiro na Mesa" (volume agregado de quem
+// nunca confirmou pagamento, sem dono nenhum atribuído). Estágios:
+// contato_feito → documentos_pendentes → pagamento_pendente → ativo.
+app.get('/api/admin/vendas-pipeline', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase.from('vendas_pipeline').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const leads = data || [];
+    // Mesmo padrão de suporte_tickets: join manual em crm_equipe (não expor
+    // GET /api/admin/equipe, restrito a administrador).
+    const ids = [...new Set(leads.map(l => l.responsavel_id).filter(Boolean))];
+    let nomePorId = {};
+    if (ids.length) {
+      const { data: pessoas } = await supabase.from('crm_equipe').select('id,nome').in('id', ids);
+      nomePorId = Object.fromEntries((pessoas || []).map(p => [p.id, p.nome]));
+    }
+    res.json({ leads: leads.map(l => ({ ...l, responsavel_nome: l.responsavel_id ? (nomePorId[l.responsavel_id] || null) : null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/vendas-pipeline', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { profissionalEmail, profissionalNome, observacoes } = req.body || {};
+    if (!profissionalEmail || !String(profissionalEmail).trim() || !profissionalNome || !String(profissionalNome).trim()) {
+      return res.status(400).json({ error: 'profissionalEmail e profissionalNome são obrigatórios' });
+    }
+    const payload = {
+      profissional_email: profissionalEmail.trim(),
+      profissional_nome: profissionalNome.trim(),
+      estagio: 'contato_feito',
+      // Quem adiciona já entra como responsável — não fica sem dono à toa;
+      // pode ser reatribuído depois via PATCH. null pra quem loga com o
+      // token antigo (sem userId).
+      responsavel_id: req.adminAuth?.userId || null,
+      observacoes: observacoes ? String(observacoes).trim() : null,
+    };
+    const { data, error } = await supabase.from('vendas_pipeline').insert(payload).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ lead: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/vendas-pipeline/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { estagio, responsavelId, observacoes } = req.body || {};
+    const updates = { atualizado_em: new Date().toISOString() };
+    if (estagio !== undefined) {
+      if (!['contato_feito', 'documentos_pendentes', 'pagamento_pendente', 'ativo'].includes(estagio)) {
+        return res.status(400).json({ error: 'Estágio inválido' });
+      }
+      updates.estagio = estagio;
+    }
+    if (responsavelId !== undefined) updates.responsavel_id = responsavelId || null;
+    if (observacoes !== undefined) updates.observacoes = observacoes ? String(observacoes).trim() : null;
+    if (Object.keys(updates).length === 1) return res.status(400).json({ error: 'Nada para atualizar' });
+    const { data, error } = await supabase.from('vendas_pipeline').update(updates).eq('id', req.params.id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Lead não encontrado' });
+    res.json({ lead: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Sair do funil de vez (fechou/esfriou) — diferente de mover pra "ativo",
+// que é um estágio normal do funil; remover é "parar de acompanhar isso
+// aqui", não um estado do processo de venda.
+app.delete('/api/admin/vendas-pipeline/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { error } = await supabase.from('vendas_pipeline').delete().eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
 // Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
 // existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
