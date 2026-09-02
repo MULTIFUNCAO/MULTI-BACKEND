@@ -4146,6 +4146,93 @@ app.post('/api/admin/demandas-suporte', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── ADMIN — MÓDULO DE SUPORTE (MULTI-CRM, handoff 2026-09-02, item 2) ───────
+// "Ticket de problema de profissional" — SEM relação com "demandas-suporte"
+// acima (aquilo é pedido de serviço criado em nome de um cliente, tabela
+// "pedidos"; isto aqui é "a Multi tem um problema pra resolver com um
+// profissional", tabela própria "suporte_tickets", ver migration
+// supabase_suporte_tickets_migration.sql). Metade da Caixa de Entrada do
+// documento "COMANDO MASTER" — a outra metade (WhatsApp Business API) segue
+// travada numa decisão de provedor, fora de escopo aqui.
+app.get('/api/admin/suporte-tickets', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { status } = req.query;
+    let query = supabase.from('suporte_tickets').select('*').order('created_at', { ascending: false });
+    if (status) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    const tickets = data || [];
+    // Nome de quem abriu/atende — join manual aqui (server-side, service_role)
+    // em vez de expor GET /api/admin/equipe pro front, que é restrito a
+    // administrador só (ver requireRole acima); qualquer pessoa da equipe
+    // pode ver quem está com um ticket, mesmo sem poder listar toda a equipe.
+    const ids = [...new Set(tickets.flatMap(t => [t.criado_por, t.atendido_por]).filter(Boolean))];
+    let nomePorId = {};
+    if (ids.length) {
+      const { data: pessoas } = await supabase.from('crm_equipe').select('id,nome').in('id', ids);
+      nomePorId = Object.fromEntries((pessoas || []).map(p => [p.id, p.nome]));
+    }
+    res.json({ tickets: tickets.map(t => ({
+      ...t,
+      criado_por_nome: t.criado_por ? (nomePorId[t.criado_por] || null) : null,
+      atendido_por_nome: t.atendido_por ? (nomePorId[t.atendido_por] || null) : null,
+    })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/suporte-tickets', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { profissionalEmail, profissionalNome, assunto, descricao, prioridade } = req.body || {};
+    const obrigatorios = { profissionalEmail, profissionalNome, assunto, descricao };
+    const faltando = Object.entries(obrigatorios).filter(([, v]) => !v || !String(v).trim()).map(([k]) => k);
+    if (faltando.length) return res.status(400).json({ error: 'Campos obrigatórios faltando: ' + faltando.join(', ') });
+    const payload = {
+      profissional_email: profissionalEmail.trim(),
+      profissional_nome: profissionalNome.trim(),
+      assunto: assunto.trim(),
+      descricao: descricao.trim(),
+      prioridade: ['baixa', 'normal', 'alta'].includes(prioridade) ? prioridade : 'normal',
+      // req.adminAuth.userId vem null pra quem ainda loga com o token antigo
+      // (senha única, sem passar por crm_equipe) — não trava a criação por
+      // isso, só fica sem "aberto por" registrado nesse caso.
+      criado_por: req.adminAuth?.userId || null,
+    };
+    const { data, error } = await supabase.from('suporte_tickets').insert(payload).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ticket: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH cobre tanto "assumir" (atendido_por + status vira em_andamento) quanto
+// "resolver" (status vira resolvido + resolvido_em + nota) — um endpoint só,
+// o front decide o que mandar conforme a ação clicada.
+app.patch('/api/admin/suporte-tickets/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { status, resolucaoNota, assumir } = req.body || {};
+    const updates = { atualizado_em: new Date().toISOString() };
+    if (assumir) {
+      updates.atendido_por = req.adminAuth?.userId || null;
+      updates.status = 'em_andamento';
+    }
+    if (status) {
+      if (!['aberto', 'em_andamento', 'resolvido'].includes(status)) return res.status(400).json({ error: 'Status inválido' });
+      updates.status = status;
+      if (status === 'resolvido') {
+        updates.resolvido_em = new Date().toISOString();
+        if (resolucaoNota) updates.resolucao_nota = String(resolucaoNota).trim();
+      }
+    }
+    if (Object.keys(updates).length === 1) return res.status(400).json({ error: 'Nada para atualizar' });
+    const { data, error } = await supabase.from('suporte_tickets').update(updates).eq('id', req.params.id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Ticket não encontrado' });
+    res.json({ ticket: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
 // Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
 // existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
