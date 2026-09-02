@@ -4362,6 +4362,15 @@ app.patch('/api/admin/vendas-pipeline/:id', async (req, res) => {
         return res.status(400).json({ error: 'Estágio inválido' });
       }
       updates.estagio = estagio;
+      // ativo_em é a data de quando ENTROU em 'ativo' — só seta na
+      // transição de verdade (handoff item 5, Metas: precisa disso pra
+      // medir tempo médio de fechamento por pessoa da equipe). Busca o
+      // estágio atual antes de decidir, pra não resetar o timestamp cada
+      // vez que alguém salva um lead que já estava ativo.
+      if (estagio === 'ativo') {
+        const { data: atual } = await supabase.from('vendas_pipeline').select('estagio').eq('id', req.params.id).maybeSingle();
+        if (atual?.estagio !== 'ativo') updates.ativo_em = new Date().toISOString();
+      }
     }
     if (responsavelId !== undefined) updates.responsavel_id = responsavelId || null;
     if (observacoes !== undefined) updates.observacoes = observacoes ? String(observacoes).trim() : null;
@@ -4658,6 +4667,147 @@ app.post('/api/admin/marketing/reengajamento', async (req, res) => {
 
     log('MARKETING REENGAJAMENTO', { totalSelecionados: emails.length, enviados: playerIds.length, semPush: semPush.length });
     res.json({ enviados: playerIds.length, sem_push: semPush });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN — METAS E DESEMPENHO (MULTI-CRM, handoff 2026-09-02, item 5) ──────
+// Meta é config manual (singleton, sem histórico por mês ainda — V1
+// simples, admin edita o alvo sempre que quiser). "Realizado" é sempre
+// calculado contra o mês corrente na hora da consulta.
+app.get('/api/admin/metas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0, 0, 0, 0);
+    const inicioMesISO = inicioMes.toISOString();
+
+    const [{ data: config }, { data: aprovadosMes }, { data: assinaturasPagasMes }, { data: pedidosMes }] = await Promise.all([
+      supabase.from('metas_mensais').select('*').eq('id', 1).maybeSingle(),
+      // Mesma limitação já documentada em /api/admin/relatorio-detalhado:
+      // não existe approved_em na tabela, usa created_at como aproximação
+      // (só pega quem CADASTROU e já está aprovado este mês — profissional
+      // aprovado este mês mas cadastrado antes não entra na contagem;
+      // avisado na resposta, não escondido).
+      supabase.from('usuarios').select('email').eq('role', 'professional').eq('approved', true).gte('created_at', inicioMesISO),
+      // assinaturas.inicio é regravado a cada pagamento confirmado
+      // (ativarAssinatura) — funciona como "data do último pagamento".
+      supabase.from('assinaturas').select('titular_email,plano,status,asaas_customer_id,cortesia,proxima_cobranca,taxa_acesso_entrada_em').gte('inicio', inicioMesISO),
+      supabase.from('pedidos').select('cliente_id').neq('origem', 'demo').gte('created_at', inicioMesISO),
+    ]);
+
+    const mensalidadesPagasMes = (assinaturasPagasMes || []).filter(a => statusPagamentoAssinatura(a) === 'pago').length;
+    const clientesAtivosMes = new Set((pedidosMes || []).map(p => p.cliente_id).filter(Boolean)).size;
+
+    res.json({
+      meta: {
+        profissionais_aprovados: config?.meta_profissionais_aprovados ?? 0,
+        mensalidades_pagas: config?.meta_mensalidades_pagas ?? 0,
+        clientes_ativos: config?.meta_clientes_ativos ?? 0,
+      },
+      realizado: {
+        profissionais_aprovados: (aprovadosMes || []).length,
+        mensalidades_pagas: mensalidadesPagasMes,
+        clientes_ativos: clientesAtivosMes,
+      },
+      limitacao: "Profissionais aprovados usa created_at (cadastro) como aproximação — não existe approved_em na tabela, então só conta quem cadastrou E já está aprovado dentro do mês corrente.",
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/metas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { profissionaisAprovados, mensalidadesPagas, clientesAtivos } = req.body || {};
+    const updates = { updated_at: new Date().toISOString(), updated_by: req.adminAuth?.userId || null };
+    if (profissionaisAprovados !== undefined) updates.meta_profissionais_aprovados = Math.max(0, Number(profissionaisAprovados) || 0);
+    if (mensalidadesPagas !== undefined) updates.meta_mensalidades_pagas = Math.max(0, Number(mensalidadesPagas) || 0);
+    if (clientesAtivos !== undefined) updates.meta_clientes_ativos = Math.max(0, Number(clientesAtivos) || 0);
+    const { data, error } = await supabase.from('metas_mensais').update(updates).eq('id', 1).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ config: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Desempenho por pessoa da equipe — só cobre quem passou por
+// vendas_pipeline (opt-in, ver item 3 do handoff), não é "todo profissional
+// aprovado por alguém" (isso não é rastreado pra quem nunca entrou no
+// funil). "Tempo médio de fechamento" só considera leads com ativo_em
+// preenchido (leads que já estavam 'ativo' antes da migration que criou
+// essa coluna não entram na média — não retroage, avisado na resposta).
+app.get('/api/admin/desempenho-equipe', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: leads, error } = await supabase.from('vendas_pipeline').select('responsavel_id,estagio,created_at,ativo_em');
+    if (error) return res.status(500).json({ error: error.message });
+    const responsavelIds = [...new Set((leads || []).map(l => l.responsavel_id).filter(Boolean))];
+    const { data: pessoas } = responsavelIds.length
+      ? await supabase.from('crm_equipe').select('id,nome').in('id', responsavelIds)
+      : { data: [] };
+
+    const porPessoa = {};
+    (leads || []).forEach(l => {
+      if (!l.responsavel_id) return;
+      const p = (porPessoa[l.responsavel_id] ||= { total: 0, fechados: 0, temposFechamentoDias: [] });
+      p.total++;
+      if (l.estagio === 'ativo') {
+        p.fechados++;
+        if (l.ativo_em && l.created_at) {
+          p.temposFechamentoDias.push((new Date(l.ativo_em) - new Date(l.created_at)) / 86400000);
+        }
+      }
+    });
+
+    const desempenho = Object.entries(porPessoa).map(([id, p]) => ({
+      responsavel_id: id,
+      responsavel_nome: pessoas?.find(x => x.id === id)?.nome || null,
+      total_no_funil: p.total,
+      fechados: p.fechados,
+      tempo_medio_fechamento_dias: p.temposFechamentoDias.length
+        ? Math.round((p.temposFechamentoDias.reduce((s, v) => s + v, 0) / p.temposFechamentoDias.length) * 10) / 10
+        : null,
+    })).sort((a, b) => b.fechados - a.fechados);
+
+    res.json({ desempenho, limitacao: "Só cobre profissionais que passaram pelo funil de Vendas (opt-in) — não é uma contagem de todo profissional aprovado por alguém." });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Ranking de categorias que mais convertem (cadastro → pagamento) — mesmo
+// universo/critério de pagamento já usado no resto do painel
+// (statusPagamentoAssinatura). Profissional com N categorias conta em CADA
+// uma (mesma decisão já tomada em /api/admin/relatorio-detalhado).
+app.get('/api/admin/ranking-categorias', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: pros, error } = await supabase
+      .from('usuarios').select('email,categoria_servico')
+      .or('role.eq.professional,autonomia_aceita_em.not.is.null');
+    if (error) return res.status(500).json({ error: error.message });
+    const emails = (pros || []).map(p => p.email);
+    const { data: assinaturas } = emails.length
+      ? await supabase.from('assinaturas').select('titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em').eq('titular_tipo', 'usuario').in('titular_email', emails)
+      : { data: [] };
+    const assinaturaPorEmail = Object.fromEntries((assinaturas || []).map(a => [a.titular_email, a]));
+
+    const porCategoria = {};
+    (pros || []).forEach(p => {
+      const cats = Array.isArray(p.categoria_servico) ? p.categoria_servico : [];
+      const pagando = statusPagamentoAssinatura(assinaturaPorEmail[p.email]) === 'pago';
+      cats.forEach(cat => {
+        const c = (porCategoria[cat] ||= { cadastrados: 0, pagando: 0 });
+        c.cadastrados++;
+        if (pagando) c.pagando++;
+      });
+    });
+
+    const ranking = Object.entries(porCategoria)
+      .map(([categoria, c]) => ({
+        categoria,
+        cadastrados: c.cadastrados,
+        pagando: c.pagando,
+        taxa_conversao_pct: c.cadastrados ? Math.round((c.pagando / c.cadastrados) * 1000) / 10 : 0,
+      }))
+      .sort((a, b) => b.taxa_conversao_pct - a.taxa_conversao_pct || b.cadastrados - a.cadastrados);
+
+    res.json({ ranking, sem_categoria: (pros || []).filter(p => !(p.categoria_servico || []).length).length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
