@@ -1200,9 +1200,12 @@ const PLANOS_ASSINATURA = {
 // decisão explícita de manter a reforma comercial separada da reforma de
 // 23 grupos/profissões aninhadas (projeto à parte). Só afeta a UI/copy do
 // front hoje, este backend nunca aplicou o teto de categoria de fato (só
-// maxServicosMes/valorMaxServico são checados abaixo, no endpoint de
-// confirmação); mantido em sync mesmo assim pra não divergir do front caso
-// um gate real seja adicionado aqui depois.
+// valorMaxServico é checado abaixo, no endpoint de confirmação); mantido em
+// sync mesmo assim pra não divergir do front caso um gate real seja
+// adicionado aqui depois. HANDOFF 2026-09-03: maxServicosMes (cota de
+// serviços/mês) deixou de ser aplicado — campo mantido só porque
+// configuracoes_planos/front ainda o referenciam, mas nada mais o lê pra
+// bloquear nada.
 const PLANO_LIMITES_USUARIO = {
   autonomo: { maxCategorias: 1, maxServicosMes: 3,  valorMaxServico: 5000 },
   pro:      { maxCategorias: 3, maxServicosMes: 10, valorMaxServico: 5000 },
@@ -1245,19 +1248,6 @@ async function getPlanoLimites() {
     log("AVISO: falha ao ler configuracoes_planos, usando fallback hardcoded", e.message || e);
     return PLANO_LIMITES_USUARIO;
   }
-}
-
-// Ciclo de cobrança rolante de 30 dias a partir de assinaturas.inicio — não
-// existe renovação automática/coluna de "última cobrança" ainda (ver aviso
-// logo acima, em /api/assinatura/cobrar), então o ciclo é sempre calculado
-// on-the-fly a partir da data de início da assinatura.
-function cicloAtualInicio(inicioISO) {
-  const inicio = new Date(inicioISO).getTime();
-  const now = Date.now();
-  const CICLO_MS = 30 * 24 * 60 * 60 * 1000;
-  if (now <= inicio) return new Date(inicio);
-  const ciclosPassados = Math.floor((now - inicio) / CICLO_MS);
-  return new Date(inicio + ciclosPassados * CICLO_MS);
 }
 
 // Busca cliente Asaas por e-mail, cria se não existir — extraído de dentro de
@@ -1984,8 +1974,10 @@ app.post("/api/admin/ativar-manual", async (req, res) => {
 // no Postgres barra escrita direta via chave anon, ver
 // supabase_lock_aceite_formal_profissional_migration.sql). É aqui que mora a
 // regra de acesso de verdade: categoria já foi filtrada no mural (frontend),
-// mas plano ativo / valor máximo / cota mensal só valem se checados aqui —
-// o frontend é só UX, quem confia cegamente no client pode ser burlado.
+// mas plano ativo / valor máximo só valem se checados aqui — o frontend é só
+// UX, quem confia cegamente no client pode ser burlado.
+// HANDOFF 2026-09-03: cota mensal de serviços (maxServicosMes) removida —
+// profissional pode aceitar quantos serviços quiser, sem teto por plano.
 // ════════════════════════════════════════════════════════════════════════════
 app.post("/api/pedidos/confirmar-servico", async (req, res) => {
   const { pedidoId, profissionalEmail, dataAgendada } = req.body || {};
@@ -2029,25 +2021,6 @@ app.post("/api/pedidos/confirmar-servico", async (req, res) => {
         valorMaxServico: limite.valorMaxServico,
         valorServico: pedido.valor,
       });
-    }
-
-    if (limite.maxServicosMes != null) {
-      const cicloInicio = cicloAtualInicio(assinatura.inicio);
-      const { count, error: errCount } = await supabase
-        .from("pedidos")
-        .select("id", { count: "exact", head: true })
-        .eq("profissional_aceito", profissionalEmail)
-        .not("aceite_formal_profissional_em", "is", null)
-        .gte("aceite_formal_profissional_em", cicloInicio.toISOString());
-      if (errCount) throw errCount;
-      if ((count || 0) >= limite.maxServicosMes) {
-        return res.status(403).json({
-          error: "quota_excedida",
-          plano: assinatura.plano,
-          maxServicosMes: limite.maxServicosMes,
-          usados: count || 0,
-        });
-      }
     }
 
     const updates = { aceite_formal_profissional_em: new Date().toISOString() };
