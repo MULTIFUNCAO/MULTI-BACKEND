@@ -4278,6 +4278,154 @@ app.patch('/api/admin/suporte-tickets/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── WHATSAPP (MULTI-CRM, handoff 2026-09-03) — segunda metade da Caixa   ──
+// de Entrada, ver supabase_whatsapp_mensagens_migration.sql. Provedor:
+// Z-API (QR code, sem aprovação Meta), decisão do usuário pra MVP. Duas
+// partes: o WEBHOOK abaixo (público, chamado pela Z-API — NÃO usa
+// checkAdminKey, usa um token próprio na query string porque a Z-API não
+// assina o payload) e as rotas /api/admin/whatsapp/* (protegidas,
+// consumidas pelo Inbox.jsx do MULTI-CRM).
+//
+// Variáveis de ambiente novas (setar no Render):
+//   ZAPI_INSTANCE_ID, ZAPI_TOKEN       — da instância criada no painel Z-API
+//   ZAPI_CLIENT_TOKEN                  — opcional, só se "Client-Token" de
+//                                        segurança da conta estiver ativado
+//   ZAPI_WEBHOOK_TOKEN                 — inventado por nós; a mesma string
+//                                        vai colada na URL de webhook
+//                                        configurada no painel da Z-API
+//                                        (?token=...), pra rejeitar POST de
+//                                        qualquer um que não seja a Z-API.
+
+function normalizarTelefone(s) {
+  return String(s || '').replace(/\D/g, '');
+}
+
+// Payload da "on-message-received" da Z-API — os nomes de campo abaixo são
+// os documentados no momento em que isto foi escrito, mas provedores de
+// WhatsApp não-oficiais mudam formato de payload com alguma frequência.
+// Primeira mensagem real que chegar, conferir o console.log abaixo contra
+// o corpo esperado e ajustar os `body.x || body.y` se precisar — deixado
+// defensivo de propósito por causa disso.
+app.post('/api/webhook-zapi', async (req, res) => {
+  const token = process.env.ZAPI_WEBHOOK_TOKEN;
+  if (!token || req.query.token !== token) {
+    console.warn('[WEBHOOK-ZAPI] Token ausente ou inválido — requisição rejeitada');
+    return res.status(401).json({ error: 'Não autorizado' });
+  }
+  const body = req.body || {};
+  console.log('[WEBHOOK-ZAPI] payload recebido:', JSON.stringify(body));
+  try {
+    const telefone = normalizarTelefone(body.phone);
+    if (!telefone) return res.status(200).json({ ok: true, ignorado: 'sem telefone' });
+    const conteudo = body.text?.message || body.message?.text || body.body || body.caption || '[mensagem sem texto — mídia não suportada no MVP]';
+    const fromMe = body.fromMe === true;
+    const payload = {
+      telefone,
+      nome_contato: body.senderName || body.chatName || body.pushname || null,
+      direcao: fromMe ? 'saida' : 'entrada',
+      conteudo,
+      zaapi_message_id: body.messageId || body.id || null,
+      // fromMe:true vindo da Z-API é mensagem mandada direto do celular
+      // (fora do CRM) — não tem "enviado_por" nosso pra associar.
+      enviado_por: null,
+      lida: fromMe, // mensagem que a própria pessoa mandou não conta como "não lida"
+    };
+    const { error } = await supabase.from('whatsapp_mensagens').insert(payload);
+    if (error) console.error('[WEBHOOK-ZAPI] Erro ao salvar mensagem:', error.message);
+    res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('[WEBHOOK-ZAPI] Erro:', e.message);
+    res.status(200).json({ ok: true }); // 200 mesmo em erro nosso — não queremos que a Z-API fique reentregando
+  }
+});
+
+// Lista de "conversas" — agrupada em JS a partir de whatsapp_mensagens (sem
+// tabela de conversa dedicada, ver migration). Volume esperado baixo nessa
+// fase; se crescer muito, revisitar com uma view/materialized view.
+app.get('/api/admin/whatsapp/conversas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase
+      .from('whatsapp_mensagens')
+      .select('telefone, nome_contato, conteudo, direcao, created_at, lida')
+      .order('created_at', { ascending: false })
+      .limit(2000); // teto de segurança pro MVP — sem paginação ainda
+    if (error) return res.status(500).json({ error: error.message });
+    const porTelefone = new Map();
+    for (const m of data || []) {
+      if (!porTelefone.has(m.telefone)) {
+        porTelefone.set(m.telefone, {
+          telefone: m.telefone,
+          nomeContato: m.nome_contato,
+          ultimaMensagem: m.conteudo,
+          ultimaEm: m.created_at,
+          naoLidas: 0,
+        });
+      }
+      const conversa = porTelefone.get(m.telefone);
+      if (!conversa.nomeContato && m.nome_contato) conversa.nomeContato = m.nome_contato;
+      if (m.direcao === 'entrada' && !m.lida) conversa.naoLidas += 1;
+    }
+    const conversas = [...porTelefone.values()].sort((a, b) => new Date(b.ultimaEm) - new Date(a.ultimaEm));
+    res.json({ conversas });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/whatsapp/mensagens/:telefone', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const telefone = normalizarTelefone(req.params.telefone);
+    const { data, error } = await supabase
+      .from('whatsapp_mensagens')
+      .select('*')
+      .eq('telefone', telefone)
+      .order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    // Marca como lida ao abrir a conversa — efeito colateral do GET, mesmo
+    // padrão simples do resto deste arquivo (sem endpoint separado só pra isso).
+    await supabase.from('whatsapp_mensagens').update({ lida: true }).eq('telefone', telefone).eq('direcao', 'entrada').eq('lida', false);
+    res.json({ mensagens: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/whatsapp/enviar', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { telefone, mensagem } = req.body || {};
+    if (!telefone || !mensagem || !String(mensagem).trim()) {
+      return res.status(400).json({ error: 'telefone e mensagem são obrigatórios' });
+    }
+    const { ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN } = process.env;
+    if (!ZAPI_INSTANCE_ID || !ZAPI_TOKEN) {
+      return res.status(500).json({ error: 'Z-API não configurada (ZAPI_INSTANCE_ID/ZAPI_TOKEN ausentes no servidor)' });
+    }
+    const telefoneNormalizado = normalizarTelefone(telefone);
+    const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`;
+    const zapiRes = await axios.post(
+      url,
+      { phone: telefoneNormalizado, message: mensagem },
+      { headers: ZAPI_CLIENT_TOKEN ? { 'Client-Token': ZAPI_CLIENT_TOKEN } : {} }
+    );
+    const payload = {
+      telefone: telefoneNormalizado,
+      direcao: 'saida',
+      conteudo: mensagem,
+      zaapi_message_id: zapiRes.data?.messageId || zapiRes.data?.id || null,
+      enviado_por: req.adminAuth?.userId || null,
+      lida: true,
+    };
+    const { data, error } = await supabase.from('whatsapp_mensagens').insert(payload).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ mensagem: data });
+  } catch (e) {
+    // Erro da própria Z-API (instância desconectada, número inválido etc.)
+    // vem em e.response.data — repassa pro front em vez de só "erro genérico".
+    const detalhe = e.response?.data?.error || e.response?.data?.message || e.message;
+    console.error('[WHATSAPP] Erro ao enviar via Z-API:', detalhe);
+    res.status(502).json({ error: `Falha ao enviar via Z-API: ${detalhe}` });
+  }
+});
+
 // ── ADMIN — VENDAS: PIPELINE DE PROFISSIONAIS (MULTI-CRM, handoff        ──
 // 2026-09-02, item 3) ───────────────────────────────────────────────────
 // Opt-in: a equipe adiciona manualmente quem está sendo trabalhado de
