@@ -4373,14 +4373,31 @@ app.post('/api/webhook-zapi', async (req, res) => {
 // Lista de "conversas" — agrupada em JS a partir de whatsapp_mensagens (sem
 // tabela de conversa dedicada, ver migration). Volume esperado baixo nessa
 // fase; se crescer muito, revisitar com uma view/materialized view.
+// ?fila=vendas|suporte|demanda (opcional) — filtra só telefones já triados
+// pra essa fila em demandas_clientes (ver especificação "Fila de Demandas de
+// Clientes", 2026-09-03). Sem o parâmetro, comportamento de sempre (todas as
+// conversas, triadas ou não) — é o que a aba WhatsApp da Caixa de Entrada usa
+// pra triagem inicial. Com o parâmetro, é o que as abas Vendas/Suporte usam
+// pra ver só o que já foi movido pra elas.
 app.get('/api/admin/whatsapp/conversas', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { data, error } = await supabase
+    const { fila } = req.query;
+    let telefonesFila = null;
+    if (fila) {
+      const { data: demandas, error: errDemandas } = await supabase
+        .from('demandas_clientes').select('telefone_cliente').eq('fila', fila).not('telefone_cliente', 'is', null);
+      if (errDemandas) return res.status(500).json({ error: errDemandas.message });
+      telefonesFila = [...new Set((demandas || []).map(d => d.telefone_cliente))];
+      if (!telefonesFila.length) return res.json({ conversas: [] }); // ninguém triado pra essa fila ainda
+    }
+    let query = supabase
       .from('whatsapp_mensagens')
       .select('telefone, nome_contato, conteudo, direcao, created_at, lida')
       .order('created_at', { ascending: false })
       .limit(2000); // teto de segurança pro MVP — sem paginação ainda
+    if (telefonesFila) query = query.in('telefone', telefonesFila);
+    const { data, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
     const porTelefone = new Map();
     for (const m of data || []) {
