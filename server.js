@@ -1188,7 +1188,7 @@ const PLANOS_ASSINATURA = {
   // front (EscolherPlanoScreen, prop taxaAcessoObrigatoria), não aparece na
   // lista normal de planos (PLANOS_USUARIO) pra não vazar pro fluxo de
   // upgrade/"Escolher plano" de quem já é profissional ativo.
-  acesso:       { valor: 9.90,   label: "Multi — Taxa de Acesso" },
+  acesso:       { valor: 27.00,  label: "Multi — Taxa de Acesso" }, // fallback legado — valor de verdade vem de config_monetizacao.valor_entrada (ver resolverValorAcesso); atualizado 2026-09-04 (era 9,90)
 };
 
 // Limites de negócio (categoria/valor/quantidade) por plano do profissional.
@@ -5533,7 +5533,7 @@ app.post("/api/cron/lembretes", async (req, res) => {
             // desse ciclo — manda e-mail e marca pra não repetir amanhã.
             // Valor do lembrete reflete o ciclo real dessa pessoa (promoção
             // ou mensalidade) — não é mais "R$ 9,90" fixo pra sempre.
-            let valorCiclo = configMonetizacao ? Number(configMonetizacao.valor_entrada) : 9.90;
+            let valorCiclo = configMonetizacao ? Number(configMonetizacao.valor_entrada) : 27.00; // fallback legado, atualizado 2026-09-04 (era 9,90)
             if (configMonetizacao && a.taxa_acesso_entrada_em) {
               const fim = new Date(a.taxa_acesso_entrada_em);
               fim.setMonth(fim.getMonth() + configMonetizacao.duracao_promocao_meses);
