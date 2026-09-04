@@ -1289,17 +1289,34 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
   // recalculado a cada renovação, como já valia pros outros planos antes
   // desta mudança). Sem isso, "2 meses de promoção" resetaria sozinho todo
   // mês. Só relevante pro plano "acesso" — null pros demais.
+  //
+  // valor_entrada_travado (2026-09-04, decisão explícita do usuário ao mudar
+  // R$9,90→R$27: "quem já está no período promocional fica como está, nem
+  // no valor atual nem na cobrança seguinte — só profissionais novos que
+  // ainda não iniciaram o ciclo pagam o valor novo"): travado UMA VEZ, no
+  // mesmo instante em que taxa_acesso_entrada_em é setado pela primeira vez
+  // — nunca sobrescrito depois, mesmo que config_monetizacao.valor_entrada
+  // mude de novo no futuro. resolverValorAcesso() usa esse valor travado em
+  // vez de reler a config atual sempre que já existir.
   let taxaAcessoEntradaEm = null;
+  let valorEntradaTravado = undefined; // undefined = não mexe na coluna (upsert preserva o valor já gravado)
   if (plano === "acesso") {
     const { data: existente } = await supabase
       .from("assinaturas")
-      .select("taxa_acesso_entrada_em")
+      .select("taxa_acesso_entrada_em, valor_entrada_travado")
       .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail)
       .maybeSingle();
-    taxaAcessoEntradaEm = existente?.taxa_acesso_entrada_em || inicio.toISOString();
+    if (existente?.taxa_acesso_entrada_em) {
+      taxaAcessoEntradaEm = existente.taxa_acesso_entrada_em;
+      valorEntradaTravado = existente.valor_entrada_travado; // já travado antes — preserva
+    } else {
+      taxaAcessoEntradaEm = inicio.toISOString();
+      const { data: config } = await supabase.from("config_monetizacao").select("valor_entrada").eq("id", 1).maybeSingle();
+      valorEntradaTravado = config ? Number(config.valor_entrada) : 27.00; // primeira vez desta pessoa — trava o valor vigente agora
+    }
   }
 
-  const { error } = await supabase.from("assinaturas").upsert({
+  const upsertPayload = {
     titular_tipo: titularTipo,
     titular_email: titularEmail,
     plano,
@@ -1319,7 +1336,9 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
     // e-mail de aviso do PRÓXIMO vencimento (ver taxa de acesso via Pix,
     // 2026-08-27).
     lembrete_pix_enviado_em: null,
-  }, { onConflict: "titular_tipo,titular_email" });
+  };
+  if (plano === "acesso" && valorEntradaTravado !== undefined) upsertPayload.valor_entrada_travado = valorEntradaTravado;
+  const { error } = await supabase.from("assinaturas").upsert(upsertPayload, { onConflict: "titular_tipo,titular_email" });
   if (error) throw error;
   return { proximaCobranca };
 }
@@ -1336,7 +1355,7 @@ async function resolverValorAcesso(titularTipo, titularEmail) {
 
   const { data: atual } = await supabase
     .from("assinaturas")
-    .select("taxa_acesso_entrada_em")
+    .select("taxa_acesso_entrada_em, valor_entrada_travado")
     .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail).eq("plano", "acesso")
     .maybeSingle();
 
@@ -1347,8 +1366,16 @@ async function resolverValorAcesso(titularTipo, titularEmail) {
   const fimPromocao = new Date(entradaEm);
   fimPromocao.setMonth(fimPromocao.getMonth() + config.duracao_promocao_meses);
   const dentroDaPromocao = Date.now() < fimPromocao.getTime();
+  // valor_entrada_travado (2026-09-04) — quem já iniciou o ciclo usa o valor
+  // que estava vigente NA ÉPOCA (travado em ativarAssinatura()), não o
+  // config.valor_entrada atual. Isso é o que garante que subir o preço não
+  // afeta quem já está dentro da promoção nem na cobrança seguinte deles —
+  // só quem ainda não tinha taxa_acesso_entrada_em (acima). Fallback pro
+  // valor atual só cobre linhas antigas que por algum motivo não passaram
+  // pelo backfill (não deveria acontecer, ver migration de 2026-09-04).
+  const valorPromocional = atual.valor_entrada_travado != null ? Number(atual.valor_entrada_travado) : Number(config.valor_entrada);
   return {
-    valor: Number(dentroDaPromocao ? config.valor_entrada : config.valor_pos_promocao),
+    valor: dentroDaPromocao ? valorPromocional : Number(config.valor_pos_promocao),
     dentroDaPromocao,
     entradaEm,
     fimPromocao,
@@ -1393,7 +1420,10 @@ function valorMensalidadeAtual(assinatura, configMonetizacao) {
     const fimPromocao = new Date(entradaEm);
     fimPromocao.setMonth(fimPromocao.getMonth() + configMonetizacao.duracao_promocao_meses);
     const dentroDaPromocao = Date.now() < fimPromocao.getTime();
-    return Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao);
+    if (!dentroDaPromocao) return Number(configMonetizacao.valor_pos_promocao);
+    // valor_entrada_travado (2026-09-04) — mesma lógica de resolverValorAcesso():
+    // quem já iniciou o ciclo usa o valor travado na época, não o config atual.
+    return assinatura.valor_entrada_travado != null ? Number(assinatura.valor_entrada_travado) : Number(configMonetizacao.valor_entrada);
   }
   return Number(PLANOS_ASSINATURA[assinatura.plano]?.valor || 0);
 }
@@ -1931,7 +1961,7 @@ app.get("/api/admin/pix-manual-pendentes", async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { data: pendentes, error } = await supabase.from("assinaturas")
-      .select("titular_tipo,titular_email,plano,pix_manual_txid,pix_manual_gerado_em,taxa_acesso_entrada_em")
+      .select("titular_tipo,titular_email,plano,pix_manual_txid,pix_manual_gerado_em,taxa_acesso_entrada_em,valor_entrada_travado")
       .eq("status", "pendente").not("pix_manual_txid", "is", null)
       .order("pix_manual_gerado_em", { ascending: false });
     if (error) throw error;
@@ -1949,7 +1979,12 @@ app.get("/api/admin/pix-manual-pendentes", async (req, res) => {
       if (!p.taxa_acesso_entrada_em) return Number(configMonetizacao.valor_entrada);
       const fim = new Date(p.taxa_acesso_entrada_em);
       fim.setMonth(fim.getMonth() + configMonetizacao.duracao_promocao_meses);
-      return Number(Date.now() < fim.getTime() ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao);
+      if (Date.now() >= fim.getTime()) return Number(configMonetizacao.valor_pos_promocao);
+      // valor_entrada_travado (2026-09-04) — já tinha entrada_em antes desta
+      // linha "pendente" atual (é uma renovação/segunda tentativa), então usa
+      // o valor travado na época, não o config atual — mesma lógica de
+      // resolverValorAcesso().
+      return p.valor_entrada_travado != null ? Number(p.valor_entrada_travado) : Number(configMonetizacao.valor_entrada);
     };
     const lista = (pendentes || []).map(p => ({
       titularTipo: p.titular_tipo,
@@ -2566,7 +2601,7 @@ app.get("/api/admin/stats", async (req, res) => {
     // não excluir).
     const [{ data: assinaturasCompletas }, { data: configMonetizacaoStats }] = await Promise.all([
       supabase.from("assinaturas")
-        .select("titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em"),
+        .select("titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,valor_entrada_travado"),
       supabase.from("config_monetizacao").select("*").eq("id", 1).maybeSingle(),
     ]);
     const assinaturasPagas = (assinaturasCompletas || []).filter(a => statusPagamentoAssinatura(a) === "pago");
@@ -3403,7 +3438,7 @@ app.get('/api/admin/professionals', async (req, res) => {
       // nunca consultada aqui antes — o painel achava que ninguém era PRO.
       emails.length
         ? supabase.from('assinaturas')
-            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia,asaas_customer_id,taxa_acesso_entrada_em')
+            .select('titular_email,plano,status,inicio,expira_em,proxima_cobranca,cortesia,asaas_customer_id,taxa_acesso_entrada_em,valor_entrada_travado')
             .eq('titular_tipo', 'usuario').in('titular_email', emails)
         : Promise.resolve({ data: [] }),
     ]);
@@ -3471,12 +3506,16 @@ app.get('/api/admin/professionals', async (req, res) => {
         else if (!dentroDaPromocao) statusCiclo = 'mensalidade_ativa';
         else if (diasParaFimPromocao != null && diasParaFimPromocao <= 7) statusCiclo = 'promocao_terminando';
         else statusCiclo = 'promocao_ativa';
+        // valor_entrada_travado (2026-09-04) — quem já tem entradaEm usa o
+        // valor travado na época (ver resolverValorAcesso()), não o config
+        // atual — subir o preço não pode afetar quem já está no ciclo.
+        const valorPromocionalTravado = assinatura.valor_entrada_travado != null ? Number(assinatura.valor_entrada_travado) : Number(configMonetizacao.valor_entrada);
         cicloFinanceiro = {
           plano_atual: dentroDaPromocao ? 'promocional' : 'mensalidade',
           data_entrada: entradaEm || null,
           fim_promocao: fimPromocao ? fimPromocao.toISOString() : null,
           proxima_cobranca: assinatura.proxima_cobranca || null,
-          valor_proxima_cobranca: Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao),
+          valor_proxima_cobranca: dentroDaPromocao ? valorPromocionalTravado : Number(configMonetizacao.valor_pos_promocao),
           status: statusCiclo,
         };
       }
@@ -3572,7 +3611,7 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
     let cicloFinanceiro = null;
     const { data: assinatura } = await supabase
       .from('assinaturas')
-      .select('plano,status,proxima_cobranca,taxa_acesso_entrada_em')
+      .select('plano,status,proxima_cobranca,taxa_acesso_entrada_em,valor_entrada_travado')
       .eq('titular_tipo', 'usuario').eq('titular_email', email)
       .maybeSingle();
     if (assinatura?.plano === 'acesso') {
@@ -3589,12 +3628,16 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
         else if (!dentroDaPromocao) statusCiclo = 'mensalidade_ativa';
         else if (diasParaFimPromocao != null && diasParaFimPromocao <= 7) statusCiclo = 'promocao_terminando';
         else statusCiclo = 'promocao_ativa';
+        // valor_entrada_travado (2026-09-04) — quem já tem entradaEm usa o
+        // valor travado na época (ver resolverValorAcesso()), não o config
+        // atual — subir o preço não pode afetar quem já está no ciclo.
+        const valorPromocionalTravado = assinatura.valor_entrada_travado != null ? Number(assinatura.valor_entrada_travado) : Number(configMonetizacao.valor_entrada);
         cicloFinanceiro = {
           plano_atual: dentroDaPromocao ? 'promocional' : 'mensalidade',
           data_entrada: entradaEm || null,
           fim_promocao: fimPromocao ? fimPromocao.toISOString() : null,
           proxima_cobranca: assinatura.proxima_cobranca || null,
-          valor_proxima_cobranca: Number(dentroDaPromocao ? configMonetizacao.valor_entrada : configMonetizacao.valor_pos_promocao),
+          valor_proxima_cobranca: dentroDaPromocao ? valorPromocionalTravado : Number(configMonetizacao.valor_pos_promocao),
           status: statusCiclo,
         };
       }
@@ -4840,7 +4883,7 @@ app.get('/api/admin/export/financeiro', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const [{ data: assinaturas }, { data: configMonetizacao }] = await Promise.all([
-      supabase.from('assinaturas').select('titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,inicio'),
+      supabase.from('assinaturas').select('titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,inicio,valor_entrada_travado'),
       supabase.from('config_monetizacao').select('*').eq('id', 1).maybeSingle(),
     ]);
     const csv = paraCSV(assinaturas || [], [
@@ -5508,7 +5551,7 @@ app.post("/api/cron/lembretes", async (req, res) => {
       const emTresDias = new Date(agoraMs + 3 * 24 * 60 * 60 * 1000).toISOString();
       const { data: assinaturasAcesso, error: errAcesso } = await supabase
         .from("assinaturas")
-        .select("titular_email,status,proxima_cobranca,lembrete_pix_enviado_em,taxa_acesso_entrada_em")
+        .select("titular_email,status,proxima_cobranca,lembrete_pix_enviado_em,taxa_acesso_entrada_em,valor_entrada_travado")
         .eq("titular_tipo", "usuario").eq("plano", "acesso")
         .is("asaas_subscription_id", null)
         .in("status", ["ativa", "trial"])
@@ -5532,12 +5575,20 @@ app.post("/api/cron/lembretes", async (req, res) => {
             // Ainda dentro dos 3 dias antes do vencimento, primeiro aviso
             // desse ciclo — manda e-mail e marca pra não repetir amanhã.
             // Valor do lembrete reflete o ciclo real dessa pessoa (promoção
-            // ou mensalidade) — não é mais "R$ 9,90" fixo pra sempre.
+            // ou mensalidade) — não é mais "R$ 9,90" fixo pra sempre. E
+            // valor_entrada_travado (2026-09-04): quem já iniciou o ciclo
+            // usa o valor travado na época, não o config.valor_entrada
+            // atual — subir o preço não pode mudar a cobrança de quem já
+            // está dentro da promoção (mesma lógica de resolverValorAcesso()).
             let valorCiclo = configMonetizacao ? Number(configMonetizacao.valor_entrada) : 27.00; // fallback legado, atualizado 2026-09-04 (era 9,90)
             if (configMonetizacao && a.taxa_acesso_entrada_em) {
               const fim = new Date(a.taxa_acesso_entrada_em);
               fim.setMonth(fim.getMonth() + configMonetizacao.duracao_promocao_meses);
-              if (Date.now() >= fim.getTime()) valorCiclo = Number(configMonetizacao.valor_pos_promocao);
+              if (Date.now() >= fim.getTime()) {
+                valorCiclo = Number(configMonetizacao.valor_pos_promocao);
+              } else if (a.valor_entrada_travado != null) {
+                valorCiclo = Number(a.valor_entrada_travado);
+              }
             }
             const valorFmt = valorCiclo.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const dataVencStr = new Date(a.proxima_cobranca).toLocaleDateString("pt-BR");
