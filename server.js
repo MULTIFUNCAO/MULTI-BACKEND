@@ -1498,6 +1498,37 @@ app.post("/api/assinatura/marcar-pendente", async (req, res) => {
   }
 });
 
+// GET /api/assinatura/status — checa o status atual de uma assinatura sem
+// depender de paymentId da Asaas. Existe especificamente pro fallback de Pix
+// estático/manual (ver gerar-pix-manual): esse caminho não gera paymentId
+// nenhum, então o polling normal (baseado em /api/status-pagamento/:id) não
+// tem o que checar. Achado 2026-09-04 (casos Eduardo Bessa/Paula, ver
+// multi_taxa_acesso_pix_manual_travado_pos_aprovacao na memória): sem isto, o
+// cliente que paga o Pix manual fica preso pra sempre na tela "aguardando
+// confirmação" mesmo depois do admin aprovar via /api/admin/ativar-manual —
+// nada no front nunca fica sabendo. O front passa a fazer polling nisto
+// (ver useEffect de pixManualFallback em PagamentoPlanoScreen) e avança
+// sozinho pra "Completar Perfil" assim que status virar "ativa".
+// Público de propósito, mesmo padrão de /api/status-pagamento/:id — só expõe
+// o status da assinatura (nada sensível), sem exigir checkAdminKey.
+app.get("/api/assinatura/status", async (req, res) => {
+  const { titularTipo, titularEmail, plano } = req.query || {};
+  if (!titularTipo || !titularEmail)
+    return res.status(400).json({ error: "titularTipo e titularEmail são obrigatórios" });
+  try {
+    let query = supabase.from("assinaturas").select("status")
+      .eq("titular_tipo", titularTipo).eq("titular_email", titularEmail);
+    if (plano) query = query.eq("plano", plano);
+    const { data, error } = await query.maybeSingle();
+    if (error) throw error;
+    const status = data?.status || null;
+    res.json({ status, isActive: status === "ativa" || status === "trial" });
+  } catch (e) {
+    log("ERRO assinatura/status", e.message || e);
+    res.status(500).json({ error: e.message || "Erro ao consultar status" });
+  }
+});
+
 app.post("/api/assinatura/cobrar", async (req, res) => {
   const {
     titularTipo, titularEmail, titularNome, plano, cupom,
