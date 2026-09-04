@@ -4426,6 +4426,130 @@ app.post('/api/admin/whatsapp/enviar', async (req, res) => {
   }
 });
 
+// ── ADMIN — FILA DE DEMANDAS DE CLIENTES (MULTI-CRM, especificação        ──
+// "Fila de Demandas de Clientes + Triagem do WhatsApp", 2026-09-03) ──────
+// Tabela NOVA e SEPARADA de demandas_pessoais (lista pessoal de tarefas da
+// equipe, sem relação com clientes — não tocada aqui). Uma conversa do
+// WhatsApp (whatsapp_mensagens) é triada manualmente pra uma de três filas —
+// 'demanda' (pedido de serviço, tela "Atendimentos"), 'vendas' ou 'suporte'
+// (ambas reaproveitam a lista de conversas do WhatsApp filtrada por fila no
+// front). Ver supabase_demandas_clientes_migration.sql.
+
+// POST /api/admin/demandas — cria (ou atualiza, se vier "id" no corpo) um
+// registro a partir de uma conversa do WhatsApp. nome_cliente é opcional no
+// corpo: se ausente, busca o nome mais recente já visto pra esse telefone em
+// whatsapp_mensagens (mesmo dado que já aparece na lista de conversas do
+// Inbox), pra não obrigar quem está triando a redigitar o nome à mão.
+app.post('/api/admin/demandas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { id, telefoneCliente, fila, regiao, categoriaServico, descricao, nomeCliente, origem } = req.body || {};
+    if (!fila || !['demanda', 'vendas', 'suporte'].includes(fila)) {
+      return res.status(400).json({ error: "fila é obrigatória e deve ser 'demanda', 'vendas' ou 'suporte'" });
+    }
+    let nome = nomeCliente || null;
+    const telefone = telefoneCliente ? normalizarTelefone(telefoneCliente) : null;
+    if (!nome && telefone) {
+      const { data: msg } = await supabase
+        .from('whatsapp_mensagens')
+        .select('nome_contato')
+        .eq('telefone', telefone)
+        .not('nome_contato', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      nome = msg?.nome_contato || null;
+    }
+    const payload = {
+      origem: origem || 'whatsapp',
+      fila,
+      telefone_cliente: telefone,
+      nome_cliente: nome,
+      regiao: regiao || null,
+      categoria_servico: categoriaServico || null,
+      descricao: descricao || null,
+    };
+    let data, error;
+    if (id) {
+      ({ data, error } = await supabase.from('demandas_clientes').update(payload).eq('id', id).select().maybeSingle());
+    } else {
+      ({ data, error } = await supabase.from('demandas_clientes').insert(payload).select().maybeSingle());
+    }
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demanda: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/demandas?fila=demanda&status=aberta — lista por fila, mais
+// recente primeiro. status é opcional (sem filtro = todos os status).
+app.get('/api/admin/demandas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { fila, status } = req.query;
+    let query = supabase.from('demandas_clientes').select('*').order('criado_em', { ascending: false });
+    if (fila) query = query.eq('fila', fila);
+    if (status) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demandas: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/admin/demandas/:id — muda status/atribuído. Não estava listado
+// como endpoint explícito na especificação, mas sem isso a tela "Atendimentos"
+// (Fase 3) não teria como marcar nada como em_andamento/resolvida — mesmo
+// padrão simples dos outros PATCH deste arquivo (suporte-tickets, vendas-
+// pipeline), body parcial, só aplica os campos que vierem.
+app.patch('/api/admin/demandas/:id', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { status, atribuidoPara } = req.body || {};
+    const update = {};
+    if (status !== undefined) {
+      if (!['aberta', 'em_andamento', 'resolvida', 'cancelada'].includes(status)) {
+        return res.status(400).json({ error: 'status inválido' });
+      }
+      update.status = status;
+      if (status === 'resolvida' || status === 'cancelada') update.resolvido_em = new Date().toISOString();
+    }
+    if (atribuidoPara !== undefined) update.atribuido_para = atribuidoPara;
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'nada para atualizar' });
+    const { data, error } = await supabase.from('demandas_clientes').update(update).eq('id', req.params.id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ demanda: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/demandas/:id/profissionais-sugeridos — dado o regiao +
+// categoria_servico já gravados na demanda, sugere profissionais aprovados
+// compatíveis. Início simples (contains/ilike), sem geolocalização/distância
+// por design desta fase — a decisão de quem chamar continua manual, isto
+// aqui só reduz o trabalho de procurar.
+app.get('/api/admin/demandas/:id/profissionais-sugeridos', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data: demanda, error: errDemanda } = await supabase
+      .from('demandas_clientes').select('regiao,categoria_servico').eq('id', req.params.id).maybeSingle();
+    if (errDemanda) return res.status(500).json({ error: errDemanda.message });
+    if (!demanda) return res.status(404).json({ error: 'Demanda não encontrada' });
+    if (!demanda.regiao && !demanda.categoria_servico) {
+      return res.json({ profissionais: [], aviso: 'Demanda sem região nem categoria de serviço definidas — nada pra sugerir ainda.' });
+    }
+    let query = supabase
+      .from('usuarios')
+      .select('email,name,whatsapp,city,categoria_servico')
+      .eq('role', 'professional')
+      .eq('approved', true);
+    if (demanda.categoria_servico) query = query.contains('categoria_servico', [demanda.categoria_servico]);
+    if (demanda.regiao) query = query.ilike('city', `%${demanda.regiao}%`);
+    const { data, error } = await query.limit(50);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({
+      profissionais: (data || []).map(p => ({ email: p.email, nome: p.name, whatsapp: p.whatsapp, cidade: p.city, categorias: p.categoria_servico || [] })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — VENDAS: PIPELINE DE PROFISSIONAIS (MULTI-CRM, handoff        ──
 // 2026-09-02, item 3) ───────────────────────────────────────────────────
 // Opt-in: a equipe adiciona manualmente quem está sendo trabalhado de
