@@ -1383,6 +1383,26 @@ async function resolverValorAcesso(titularTipo, titularEmail) {
   };
 }
 
+// GET público (sem checkAdminKey) — o app cliente/profissional (MULTI,
+// anon key, RLS nega leitura direta de "config_monetizacao") precisa saber
+// o valor vigente da Taxa de Acesso pra exibir no card da Home/tela de
+// cadastro/EscolherPlanoScreen, sem hardcodar o número no front (achado
+// 2026-09-05: commit "R$9,90 -> R$27" tinha hardcoded o texto em ~8 lugares
+// do App.jsx — mudar de novo no banco não refletia no site sem deploy). Só
+// os 3 campos realmente exibidos ao público; nada de comissao_*/updated_by.
+app.get("/api/config/precos", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("config_monetizacao").select("valor_entrada,duracao_promocao_meses,valor_pos_promocao").eq("id", 1).maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: "Config de monetização não encontrada" });
+    res.json({
+      taxaAcesso: Number(data.valor_entrada),
+      duracaoPromocaoMeses: data.duracao_promocao_meses,
+      taxaAcessoPosPromocao: Number(data.valor_pos_promocao),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CORREÇÃO DO MODELO FINANCEIRO (MULTI-CRM, handoff 2026-09-01) ───────────
 // Duas funções síncronas (sem round-trip ao banco por linha — recebem
 // "assinatura" e "configMonetizacao" já carregados) pra classificar/precificar
