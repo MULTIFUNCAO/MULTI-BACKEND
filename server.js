@@ -4494,18 +4494,25 @@ app.post('/api/webhook-zapi', async (req, res) => {
 // Lista de "conversas" — agrupada em JS a partir de whatsapp_mensagens (sem
 // tabela de conversa dedicada, ver migration). Volume esperado baixo nessa
 // fase; se crescer muito, revisitar com uma view/materialized view.
-// ?fila=vendas|suporte|demanda (opcional) — filtra só telefones já triados
-// pra essa fila em demandas_clientes (ver especificação "Fila de Demandas de
-// Clientes", 2026-09-03). Sem o parâmetro, comportamento de sempre (todas as
-// conversas, triadas ou não) — é o que a aba WhatsApp da Caixa de Entrada usa
-// pra triagem inicial. Com o parâmetro, é o que as abas Vendas/Suporte usam
-// pra ver só o que já foi movido pra elas.
+// ?fila=vendas|suporte|demanda|triagem (opcional) — filtra só telefones já
+// triados pra essa fila em demandas_clientes (ver especificação "Fila de
+// Demandas de Clientes", 2026-09-03). ?fila=novas (Fase 2 do diagnóstico de
+// estrutura do CRM, 2026-09-06) é o inverso: telefones que NUNCA tiveram
+// nenhuma linha em demandas_clientes — a view "Novas" da Triagem, ninguém
+// olhou ainda. Sem nenhum parâmetro, comportamento de sempre (todas as
+// conversas, triadas ou não) — é o que a aba WhatsApp usa.
 app.get('/api/admin/whatsapp/conversas', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { fila } = req.query;
-    let telefonesFila = null;
-    if (fila) {
+    let telefonesFila = null; // filtra PRA dentro desta lista
+    let telefonesExcluir = null; // filtra PRA fora desta lista (só 'novas')
+    if (fila === 'novas') {
+      const { data: todasDemandas, error: errTodas } = await supabase
+        .from('demandas_clientes').select('telefone_cliente').not('telefone_cliente', 'is', null);
+      if (errTodas) return res.status(500).json({ error: errTodas.message });
+      telefonesExcluir = new Set((todasDemandas || []).map(d => d.telefone_cliente));
+    } else if (fila) {
       const { data: demandas, error: errDemandas } = await supabase
         .from('demandas_clientes').select('telefone_cliente').eq('fila', fila).not('telefone_cliente', 'is', null);
       if (errDemandas) return res.status(500).json({ error: errDemandas.message });
@@ -4522,6 +4529,7 @@ app.get('/api/admin/whatsapp/conversas', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
     const porTelefone = new Map();
     for (const m of data || []) {
+      if (telefonesExcluir && telefonesExcluir.has(m.telefone)) continue; // já triado — não é "nova"
       if (!porTelefone.has(m.telefone)) {
         porTelefone.set(m.telefone, {
           telefone: m.telefone,
@@ -4596,25 +4604,44 @@ app.post('/api/admin/whatsapp/enviar', async (req, res) => {
 });
 
 // ── ADMIN — FILA DE DEMANDAS DE CLIENTES (MULTI-CRM, especificação        ──
-// "Fila de Demandas de Clientes + Triagem do WhatsApp", 2026-09-03) ──────
+// "Fila de Demandas de Clientes + Triagem do WhatsApp", 2026-09-03; ampliado
+// na Fase 2 do diagnóstico de estrutura do CRM, 2026-09-06, "Caixa de
+// Entrada como Triagem") ─────────────────────────────────────────────────
 // Tabela NOVA e SEPARADA de demandas_pessoais (lista pessoal de tarefas da
 // equipe, sem relação com clientes — não tocada aqui). Uma conversa do
-// WhatsApp (whatsapp_mensagens) é triada manualmente pra uma de três filas —
-// 'demanda' (pedido de serviço, tela "Atendimentos"), 'vendas' ou 'suporte'
-// (ambas reaproveitam a lista de conversas do WhatsApp filtrada por fila no
-// front). Ver supabase_demandas_clientes_migration.sql.
+// WhatsApp (whatsapp_mensagens) é triada manualmente — 'triagem' (aberta pra
+// alguém olhar, sem destino decidido ainda — default de "fila", novo nesta
+// fase) até virar uma de três filas finais: 'demanda' (pedido de serviço,
+// tela "Atendimentos"), 'vendas' ou 'suporte' (as três reaproveitam a lista
+// de conversas do WhatsApp filtrada por fila no front). Ver
+// supabase_demandas_clientes_migration.sql +
+// supabase_demandas_clientes_triagem_migration.sql (Fase 2).
+//
+// "Novas" (conversa sem NENHUMA linha aqui ainda) não é um valor de fila —
+// é a ausência de registro, ver GET /api/admin/whatsapp/conversas?fila=novas
+// abaixo. "Em triagem" vs. "Retornaram para triagem" também não usam coluna
+// própria: as duas são fila='triagem', diferenciadas por atualizado_em ==
+// criado_em (nunca saiu daqui) ou != (foi movida e voltou) — ver
+// TRIAGEM_JA_MOVIMENTADA no MULTI-CRM.
+
+const DEMANDAS_FILAS = ['triagem', 'demanda', 'vendas', 'suporte'];
+const DEMANDAS_STATUS = ['aberta', 'em_andamento', 'aguardando_resposta', 'resolvida', 'cancelada'];
 
 // POST /api/admin/demandas — cria (ou atualiza, se vier "id" no corpo) um
-// registro a partir de uma conversa do WhatsApp. nome_cliente é opcional no
-// corpo: se ausente, busca o nome mais recente já visto pra esse telefone em
-// whatsapp_mensagens (mesmo dado que já aparece na lista de conversas do
-// Inbox), pra não obrigar quem está triando a redigitar o nome à mão.
+// registro a partir de uma conversa do WhatsApp. "fila" agora é opcional —
+// omitida (ou 'triagem' explícito) abre a conversa pra triagem sem já
+// decidir o destino; informada com um dos 3 destinos finais, encaminha
+// direto (comportamento de antes, "Mover para fila"). nome_cliente é
+// opcional no corpo: se ausente, busca o nome mais recente já visto pra
+// esse telefone em whatsapp_mensagens (mesmo dado que já aparece na lista
+// de conversas do Inbox), pra não obrigar quem está triando a redigitar.
 app.post('/api/admin/demandas', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { id, telefoneCliente, fila, regiao, categoriaServico, descricao, nomeCliente, origem } = req.body || {};
-    if (!fila || !['demanda', 'vendas', 'suporte'].includes(fila)) {
-      return res.status(400).json({ error: "fila é obrigatória e deve ser 'demanda', 'vendas' ou 'suporte'" });
+    const filaFinal = fila || 'triagem';
+    if (!DEMANDAS_FILAS.includes(filaFinal)) {
+      return res.status(400).json({ error: `fila deve ser uma de: ${DEMANDAS_FILAS.join(', ')}` });
     }
     let nome = nomeCliente || null;
     const telefone = telefoneCliente ? normalizarTelefone(telefoneCliente) : null;
@@ -4629,14 +4656,20 @@ app.post('/api/admin/demandas', async (req, res) => {
         .maybeSingle();
       nome = msg?.nome_contato || null;
     }
+    // criado_em/atualizado_em explícitos e IGUAIS na criação (em vez de
+    // confiar em dois now() do banco, que podem diferir por microssegundos)
+    // — é essa igualdade que marca "nunca saiu da triagem" (ver comentário
+    // acima e no front).
+    const agora = new Date().toISOString();
     const payload = {
       origem: origem || 'whatsapp',
-      fila,
+      fila: filaFinal,
       telefone_cliente: telefone,
       nome_cliente: nome,
       regiao: regiao || null,
       categoria_servico: categoriaServico || null,
       descricao: descricao || null,
+      ...(id ? { atualizado_em: agora } : { criado_em: agora, atualizado_em: agora }),
     };
     let data, error;
     if (id) {
@@ -4650,7 +4683,7 @@ app.post('/api/admin/demandas', async (req, res) => {
 });
 
 // GET /api/admin/demandas?fila=demanda&status=aberta — lista por fila, mais
-// recente primeiro. status é opcional (sem filtro = todos os status).
+// recente primeiro. fila/status são opcionais (sem filtro = todos).
 app.get('/api/admin/demandas', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
@@ -4664,28 +4697,103 @@ app.get('/api/admin/demandas', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/admin/demandas/:id — muda status/atribuído. Não estava listado
-// como endpoint explícito na especificação, mas sem isso a tela "Atendimentos"
-// (Fase 3) não teria como marcar nada como em_andamento/resolvida — mesmo
-// padrão simples dos outros PATCH deste arquivo (suporte-tickets, vendas-
-// pipeline), body parcial, só aplica os campos que vierem.
+// PATCH /api/admin/demandas/:id — muda fila (encaminhar pra vendas/suporte/
+// serviços, ou devolver pra 'triagem') e/ou status/atribuído. Body parcial,
+// só aplica os campos que vierem.
+// - "fila" sozinha (sem "status" no mesmo corpo) reabre como 'aberta' no
+//   destino novo — encaminhar é sempre um recomeço na fila de chegada, quem
+//   estava "em_andamento"/"aguardando_resposta" numa fila não carrega esse
+//   estado pra outra.
+// - "assumir" (mesmo padrão de suporte-tickets/vendas-pipeline): marca
+//   atribuido_para = quem está logado + status em_andamento, um clique só.
+// - atualizado_em sempre avança em qualquer PATCH — é o que diferencia "Em
+//   triagem" (nunca mudou) de "Retornaram para triagem" (mudou e fila
+//   voltou a 'triagem') na tela de Triagem do MULTI-CRM.
 app.patch('/api/admin/demandas/:id', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { status, atribuidoPara } = req.body || {};
-    const update = {};
+    const { fila, status, atribuidoPara, assumir } = req.body || {};
+    const update = { atualizado_em: new Date().toISOString() };
+    if (fila !== undefined) {
+      if (!DEMANDAS_FILAS.includes(fila)) return res.status(400).json({ error: `fila deve ser uma de: ${DEMANDAS_FILAS.join(', ')}` });
+      update.fila = fila;
+      if (status === undefined) update.status = 'aberta'; // recomeço na fila de chegada
+    }
+    if (assumir) {
+      update.atribuido_para = req.adminAuth?.userId || null;
+      update.status = 'em_andamento';
+    }
     if (status !== undefined) {
-      if (!['aberta', 'em_andamento', 'resolvida', 'cancelada'].includes(status)) {
-        return res.status(400).json({ error: 'status inválido' });
-      }
+      if (!DEMANDAS_STATUS.includes(status)) return res.status(400).json({ error: `status deve ser um de: ${DEMANDAS_STATUS.join(', ')}` });
       update.status = status;
       if (status === 'resolvida' || status === 'cancelada') update.resolvido_em = new Date().toISOString();
     }
     if (atribuidoPara !== undefined) update.atribuido_para = atribuidoPara;
-    if (!Object.keys(update).length) return res.status(400).json({ error: 'nada para atualizar' });
+    if (Object.keys(update).length === 1) return res.status(400).json({ error: 'nada para atualizar' }); // só atualizado_em não conta
     const { data, error } = await supabase.from('demandas_clientes').update(update).eq('id', req.params.id).select().maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ demanda: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/triagem-metricas — item 4 da Fase 2 do diagnóstico de
+// estrutura do CRM (2026-09-06). Painel simples dentro da própria tela de
+// Triagem (não a Visão Geral ainda). Tudo calculado a partir de
+// whatsapp_mensagens + demandas_clientes, nada inventado — mapa de origem:
+//   leadsRecebidosHoje  → whatsapp_mensagens → telefone cuja PRIMEIRA
+//                         mensagem (min created_at) caiu hoje            → count distinct telefone
+//   leadsTriadosHoje    → demandas_clientes  → criado_em hoje            → count distinct telefone_cliente
+//   leadsNaoTriados     → whatsapp_mensagens → telefone SEM nenhuma linha
+//                         em demandas_clientes (mesmo critério de
+//                         ?fila=novas)                                   → count distinct telefone
+//   enviadosHoje.*      → demandas_clientes  → fila=X e atualizado_em
+//                         hoje                                          → count
+//                         Aproximação, não exata: atualizado_em também
+//                         avança em qualquer PATCH de status (assumir/
+//                         finalizar/etc, não só troca de fila) — não existe
+//                         histórico de fila por linha pra medir "entrou
+//                         nessa fila hoje" com precisão. Na prática mede
+//                         "teve alguma atividade nessa fila hoje", que é
+//                         honesto o bastante pro painel simples desta fase.
+//   pendentes           → demandas_clientes  → fila != 'triagem' e status
+//                         in (aberta, aguardando_resposta)               → count
+app.get('/api/admin/triagem-metricas', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const [{ data: mensagens, error: errMsg }, { data: demandas, error: errDem }] = await Promise.all([
+      supabase.from('whatsapp_mensagens').select('telefone,created_at'),
+      supabase.from('demandas_clientes').select('telefone_cliente,fila,status,criado_em,atualizado_em'),
+    ]);
+    if (errMsg) return res.status(500).json({ error: errMsg.message });
+    if (errDem) return res.status(500).json({ error: errDem.message });
+
+    const hoje = new Date().toISOString().slice(0, 10);
+    const primeiraMsgPorTelefone = new Map();
+    for (const m of mensagens || []) {
+      const atual = primeiraMsgPorTelefone.get(m.telefone);
+      if (!atual || m.created_at < atual) primeiraMsgPorTelefone.set(m.telefone, m.created_at);
+    }
+    const leadsRecebidosHoje = [...primeiraMsgPorTelefone.values()].filter(d => d?.startsWith(hoje)).length;
+
+    const telefonesTriados = new Set((demandas || []).map(d => d.telefone_cliente).filter(Boolean));
+    const leadsNaoTriados = [...primeiraMsgPorTelefone.keys()].filter(tel => !telefonesTriados.has(tel)).length;
+
+    const telefonesTriadosHoje = new Set(
+      (demandas || []).filter(d => d.criado_em?.startsWith(hoje) && d.telefone_cliente).map(d => d.telefone_cliente)
+    );
+    const leadsTriadosHoje = telefonesTriadosHoje.size;
+
+    const enviadosHoje = {
+      vendas: (demandas || []).filter(d => d.fila === 'vendas' && d.atualizado_em?.startsWith(hoje)).length,
+      suporte: (demandas || []).filter(d => d.fila === 'suporte' && d.atualizado_em?.startsWith(hoje)).length,
+      servicos: (demandas || []).filter(d => d.fila === 'demanda' && d.atualizado_em?.startsWith(hoje)).length,
+    };
+
+    const pendentes = (demandas || []).filter(
+      d => d.fila !== 'triagem' && (d.status === 'aberta' || d.status === 'aguardando_resposta')
+    ).length;
+
+    res.json({ leadsRecebidosHoje, leadsTriadosHoje, leadsNaoTriados, enviadosHoje, pendentes });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
