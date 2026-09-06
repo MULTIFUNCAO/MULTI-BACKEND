@@ -2601,8 +2601,17 @@ app.patch("/api/admin/config-monetizacao", async (req, res) => {
 app.get("/api/admin/stats", async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { data: usuarios } = await supabase.from("usuarios").select("role,created_at");
-    const pros = usuarios?.filter(u => u.role === "professional") || [];
+    // Fase 1 do diagnóstico de estrutura do CRM (2026-09-06) — achado ao
+    // vivo testando os StatTiles clicáveis: "Profissionais" aqui usava só
+    // role='professional' (60), mas o clique agora abre GET
+    // /api/admin/professionals, que usa o critério mais amplo (role=
+    // 'professional' OU autonomia_aceita_em preenchido — pra não esconder
+    // quem ficou preso em role='client' pelo bug de durabilidade conhecido,
+    // ver comentário lá). Resultado: o card dizia 60 e a lista abria com 84,
+    // uma inconsistência visível clicando. Alinhado aqui pro mesmo critério
+    // — ORIGEM: usuarios → role='professional' OR autonomia_aceita_em IS NOT NULL → count.
+    const { data: usuarios } = await supabase.from("usuarios").select("role,created_at,autonomia_aceita_em");
+    const pros = usuarios?.filter(u => u.role === "professional" || u.autonomia_aceita_em) || [];
     const clients = usuarios?.filter(u => u.role === "client") || [];
     const hoje = new Date().toISOString().split("T")[0];
     const novosHoje = usuarios?.filter(u => u.created_at?.startsWith(hoje)) || [];
@@ -2676,13 +2685,21 @@ app.get("/api/admin/stats", async (req, res) => {
     // Mapa de origem de cada indicador desta rota (Fase 1 do diagnóstico de
     // estrutura do CRM, 2026-09-06 — rastreabilidade, não vira UI):
     //   totalClients      → usuarios      → role                    → ='client'                            → count
-    //   totalPros         → usuarios      → role                    → ='professional'                      → count
+    //   totalPros         → usuarios      → role='professional' OR autonomia_aceita_em IS NOT NULL → count
     //   proAtivos/mrr     → assinaturas   → statusPagamentoAssinatura(a) === 'pago' (asaas_customer_id/cortesia + não vencida) → count / soma valorMensalidadeAtual(a)
     //   totalPedidos      → pedidos       → origem                  → != 'demo'                             → count
     //   pedidosConcluidos → pedidos       → status                  → = 'concluido'                         → count
     //   valorMovimentado  → pedidos       → status                  → = 'concluido'                         → soma(valor)
+    //
+    // totalUsers = total de linhas em usuarios (não pros.length+clients.length):
+    // desde que totalPros passou a incluir quem tem autonomia_aceita_em
+    // preenchido (Fase 1 do diagnóstico, 2026-09-06), alguém com
+    // role='client' E autonomia_aceita_em set (os ~24 casos de "Profissional
+    // preso (role)") cai em `pros` E em `clients` ao mesmo tempo — somar os
+    // dois contaria essa pessoa 2x. Consumido também por
+    // MULTI/src/AdminDashboard.jsx (Admin antigo, "Total Usuários").
     res.json({
-      totalUsers: pros.length + clients.length,
+      totalUsers: usuarios?.length || 0,
       totalPros: pros.length,
       totalClients: clients.length,
       proAtivos,
