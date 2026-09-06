@@ -2632,15 +2632,25 @@ app.get("/api/admin/stats", async (req, res) => {
     // usa a MESMA definição já usada em /api/admin/clientes e
     // /api/admin/clientes/:email (soma de "valor" só dos pedidos com
     // status='concluido') — não inventar um segundo número de "valor
-    // movimentado" divergente pro dashboard. "pedidosFechados" conta
-    // profissional_aceito preenchido (alguém foi escolhido), independente do
-    // status final — é sobre fechar negociação, não sobre concluir serviço.
+    // movimentado" divergente pro dashboard.
+    //
+    // Fase 1 do diagnóstico de estrutura do CRM (2026-09-06): "pedidosFechados"
+    // contava profissional_aceito preenchido (alguém foi escolhido) e
+    // aparecia na Visão Geral como "Fechados" — o card media aceite de
+    // proposta/negociação, não conclusão real do serviço, o que gerava
+    // números que pareciam inventados (ex: "52 pedidos fechados" sem nenhum
+    // serviço de fato concluído). Renomeado para "pedidosConcluidos", agora
+    // com a MESMA condição de "valorMovimentado" logo abaixo (status =
+    // 'concluido' = serviço genuinamente finalizado). Único consumidor
+    // confirmado do campo antigo era Overview.jsx (MULTI-CRM) — atualizado
+    // junto nesta mesma fase.
     const { data: pedidos } = await supabase
       .from("pedidos")
       .select("status,valor,profissional_aceito,created_at")
       .neq("origem", "demo"); // pedido fictício não é solicitação real, não deve inflar os cards
     const totalPedidos = (pedidos || []).length;
-    const pedidosFechados = (pedidos || []).filter(p => p.profissional_aceito).length;
+    // ORIGEM: tabela pedidos → campo status → condição status='concluido' → resultado: count.
+    const pedidosConcluidos = (pedidos || []).filter(p => p.status === "concluido").length;
     const valorMovimentado = (pedidos || [])
       .filter(p => p.status === "concluido")
       .reduce((s, p) => s + (Number(p.valor) || 0), 0);
@@ -2663,6 +2673,14 @@ app.get("/api/admin/stats", async (req, res) => {
     });
     const cadastrosPorDia = Object.entries(porDia).map(([data, count]) => ({ data, count }));
 
+    // Mapa de origem de cada indicador desta rota (Fase 1 do diagnóstico de
+    // estrutura do CRM, 2026-09-06 — rastreabilidade, não vira UI):
+    //   totalClients      → usuarios      → role                    → ='client'                            → count
+    //   totalPros         → usuarios      → role                    → ='professional'                      → count
+    //   proAtivos/mrr     → assinaturas   → statusPagamentoAssinatura(a) === 'pago' (asaas_customer_id/cortesia + não vencida) → count / soma valorMensalidadeAtual(a)
+    //   totalPedidos      → pedidos       → origem                  → != 'demo'                             → count
+    //   pedidosConcluidos → pedidos       → status                  → = 'concluido'                         → count
+    //   valorMovimentado  → pedidos       → status                  → = 'concluido'                         → soma(valor)
     res.json({
       totalUsers: pros.length + clients.length,
       totalPros: pros.length,
@@ -2672,7 +2690,7 @@ app.get("/api/admin/stats", async (req, res) => {
       novosHoje: novosHoje.length,
       receitaEstimada: mrr.toFixed(2),
       totalPedidos,
-      pedidosFechados,
+      pedidosConcluidos,
       valorMovimentado,
       cadastrosPorDia,
     });
@@ -3021,6 +3039,18 @@ app.get('/api/admin/oportunidades', async (req, res) => {
     const agora = Date.now();
     const horasDesde = (iso) => iso ? Math.round((agora - new Date(iso).getTime()) / 3600000) : null;
 
+    // ORIGEM ('sem_proposta' / 'proposta_sem_resposta', Fase 1 do diagnóstico
+    // de estrutura do CRM, 2026-09-06): tabela pedidos → status='aberto' →
+    // 'sem_proposta' = zero linhas em propostas pra esse pedido_id;
+    // 'proposta_sem_resposta' = tem proposta(s), e pelo menos uma com
+    // status='pendente'. A definição é real e não muda aqui — mas o
+    // Overview.jsx (Visão Geral) parou de exibir esses dois tipos no bloco
+    // "Precisa de atenção" nesta fase, porque a regra nunca foi validada
+    // como conceito de negócio (documento de revisão do CRM, item 4) nem
+    // exposta pra quem usa o painel — só existia em comentário de código.
+    // Continuam calculados aqui (o sino de notificações em Layout.jsx ainda
+    // os usa) até a Fase 6 (Demandas/Match) decidir se isso vira um conceito
+    // real ligado a Serviço/Demanda.
     const itens = [];
     (pedidos || []).forEach(p => {
       const contato = usuarioPorEmail[p.cliente_id] || {};
@@ -3572,9 +3602,20 @@ app.get('/api/admin/professionals', async (req, res) => {
     // caso que o comentário lá em cima descreve (autonomia aceita, mas
     // role nunca virou 'professional'), útil pra debugar sem precisar ir
     // no banco direto.
+    //
+    // Fase 1 do diagnóstico de estrutura do CRM (2026-09-06): "pago" e
+    // "pagamento_pendente" são um EIXO DIFERENTE de "approved"/"pendente"
+    // acima (aquele é sobre aprovação de cadastro; este é sobre pagamento —
+    // usam o mesmo campo `paymentStatus` já calculado por profissional
+    // acima, ver comentário de statusPagamentoAssinatura). Adicionados pra
+    // permitir que a Visão Geral abra a lista já filtrada ao clicar em
+    // "Receita recorrente" (pago) ou "Dinheiro na mesa" (pagamento_pendente)
+    // — ver Overview.jsx.
     if (status === 'approved') professionals = professionals.filter(p => p.approved);
     else if (status === 'pendente') professionals = professionals.filter(p => !p.approved);
     else if (status === 'role_divergente') professionals = professionals.filter(p => p.role !== 'professional');
+    else if (status === 'pago') professionals = professionals.filter(p => p.paymentStatus === 'pago');
+    else if (status === 'pagamento_pendente') professionals = professionals.filter(p => p.paymentStatus === 'sem_plano' || p.paymentStatus === 'sem_confirmacao');
     res.json({ professionals });
   } catch(e) {
     res.status(500).json({ error: e.message });
