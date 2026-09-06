@@ -5339,20 +5339,33 @@ app.get('/api/admin/score-churn', async (req, res) => {
 });
 
 // ── ADMIN - FINANCEIRO ─────────────────────────────────────────
-// Estimativa a partir de "assinaturas" (status ativa) — a tabela "payments"
-// existe mas está vazia hoje (nenhum webhook Asaas gravou lá ainda), e não há
-// status "concluído"/"pago" nos pedidos reais para somar receita de serviços.
+// Fase 1 do diagnóstico de estrutura do CRM (2026-09-06) — migração pedida
+// pelo usuário depois de confirmar o achado: esta rota calculava receita com
+// "activeSubscriptions × 29,90" fixo e contava status='ativa' sem checar
+// pagamento real (mesmo bug já corrigido em /api/admin/stats em 2026-09-01).
+// Agora reaproveita as MESMAS funções (statusPagamentoAssinatura/
+// valorMensalidadeAtual) em vez de duplicar com critério divergente — fonte
+// única de receita, como pedido. "Assinaturas Ativas"/"Receita PRO" passam a
+// significar quem realmente paga (proAtivos/mrr), não linha crua com
+// status='ativa' (que inclui teste gravado direto via SQL, nunca confirmado
+// na Asaas). totalWallets/totalWithdrawals continuam '0,00' — estado vazio
+// honesto, não existe carteira/saque na plataforma hoje.
+// Único consumidor: MULTI/src/AdminDashboard.jsx (Admin antigo, aba
+// "Financeiro") — avisar antes de qualquer mudança de formato da resposta.
 app.get('/api/admin/financial', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const [{ data: ativas }, { data: pedidosAbertos, count: pendingPayments }, { data: despesas }] = await Promise.all([
-      supabase.from('assinaturas').select('plano,titular_email,inicio').eq('status', 'ativa'),
+    const [{ data: assinaturasCompletas }, { data: configMonetizacaoFinancial }, { count: pendingPayments }, { data: despesas }] = await Promise.all([
+      supabase.from('assinaturas')
+        .select('titular_tipo,titular_email,plano,status,proxima_cobranca,asaas_customer_id,cortesia,taxa_acesso_entrada_em,valor_entrada_travado'),
+      supabase.from('config_monetizacao').select('*').eq('id', 1).maybeSingle(),
       // pedido fictício fica sempre "aberto" — excluído pra não inflar pendingPayments.
       supabase.from('pedidos').select('id', { count: 'exact', head: true }).eq('status', 'aberto').neq('origem', 'demo'),
       supabase.from('despesas').select('valor'),
     ]);
-    const activeSubscriptions = ativas?.length || 0;
-    const proRevenue = activeSubscriptions * 29.90;
+    const assinaturasPagas = (assinaturasCompletas || []).filter(a => statusPagamentoAssinatura(a) === 'pago');
+    const activeSubscriptions = assinaturasPagas.length;
+    const proRevenue = assinaturasPagas.reduce((s, a) => s + valorMensalidadeAtual(a, configMonetizacaoFinancial), 0);
     const totalDespesas = (despesas || []).reduce((s, d) => s + (Number(d.valor) || 0), 0);
     res.json({
       totalRevenue: proRevenue.toFixed(2),
