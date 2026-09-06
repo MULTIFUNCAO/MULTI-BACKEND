@@ -4678,6 +4678,10 @@ app.post('/api/admin/demandas', async (req, res) => {
       ({ data, error } = await supabase.from('demandas_clientes').insert(payload).select().maybeSingle());
     }
     if (error) return res.status(500).json({ error: error.message });
+    // Fase 3 do diagnóstico de estrutura do CRM (2026-09-06), item 1: chegou
+    // (ou continua) em fila='vendas' -> gera/mantém o lead em vendas_pipeline
+    // automaticamente, sem recadastro manual. Best-effort, ver função.
+    if (data && data.fila === 'vendas') await sincronizarVendasPipelineDaDemanda(data.id);
     res.json({ demanda: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4732,6 +4736,10 @@ app.patch('/api/admin/demandas/:id', async (req, res) => {
     if (Object.keys(update).length === 1) return res.status(400).json({ error: 'nada para atualizar' }); // só atualizado_em não conta
     const { data, error } = await supabase.from('demandas_clientes').update(update).eq('id', req.params.id).select().maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
+    // Fase 3, item 1: encaminhar (ou reencaminhar) pra 'vendas' por aqui
+    // também gera/mantém o lead automaticamente — mesma função do POST,
+    // idempotente via demanda_id.
+    if (data && data.fila === 'vendas') await sincronizarVendasPipelineDaDemanda(data.id);
     res.json({ demanda: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4828,17 +4836,146 @@ app.get('/api/admin/demandas/:id/profissionais-sugeridos', async (req, res) => {
 });
 
 // ── ADMIN — VENDAS: PIPELINE DE PROFISSIONAIS (MULTI-CRM, handoff        ──
-// 2026-09-02, item 3) ───────────────────────────────────────────────────
+// 2026-09-02, item 3; ligado à Triagem e com busca de cadastro existente na
+// Fase 3 do diagnóstico de estrutura do CRM, 2026-09-06) ─────────────────
 // Opt-in: a equipe adiciona manualmente quem está sendo trabalhado de
 // verdade — não confundir com "Dinheiro na Mesa" (volume agregado de quem
 // nunca confirmou pagamento, sem dono nenhum atribuído). Estágios:
-// contato_feito → documentos_pendentes → pagamento_pendente → ativo.
+// novo_lead → contato_feito → aguardando_resposta → documentos_pendentes →
+// pagamento_pendente → ativo → pagamento_confirmado (este último nunca é
+// setado manualmente, ver GET abaixo).
+const VENDAS_ESTAGIOS = [
+  'novo_lead', 'contato_feito', 'aguardando_resposta', 'documentos_pendentes',
+  'pagamento_pendente', 'ativo', 'pagamento_confirmado',
+];
+
+// Busca um cadastro existente em "usuarios" por e-mail (exato, aceita
+// maiúscula/minúscula) ou telefone (normalizado — usuarios.whatsapp guarda
+// COM máscara, tipo "(48) 99990-4988", e quem chama aqui geralmente só tem
+// o telefone cru de demandas_clientes.telefone_cliente, só dígitos — por
+// isso a comparação normaliza os dois lados em vez de confiar em igualdade
+// direta). Nome NUNCA decide sozinho (nome parecido já causou duplicata
+// real — ver caso Adilson/Adilsonvitoria na memória do projeto) — não é
+// nem recebido aqui como critério de busca.
+// Retorna { match, ambiguo, candidatos } — "ambiguo" quando o telefone bate
+// com mais de um cadastro (número reciclado, por ex.): quem chama não deve
+// decidir sozinho, devolve pra pessoa da equipe resolver.
+async function buscarUsuarioExistente({ email, telefone }) {
+  if (email && String(email).trim()) {
+    const { data, error } = await supabase
+      .from('usuarios').select('email,name,whatsapp,role')
+      .ilike('email', email.trim()) // ilike sem % = exato, só ignora caixa
+      .limit(1);
+    if (error) throw error;
+    if (data && data.length) return { match: data[0], ambiguo: false, candidatos: [] };
+  }
+  if (telefone) {
+    const alvo = normalizarTelefone(telefone);
+    if (alvo) {
+      const { data, error } = await supabase.from('usuarios').select('email,name,whatsapp,role').not('whatsapp', 'is', null);
+      if (error) throw error;
+      const candidatos = (data || []).filter(u => normalizarTelefone(u.whatsapp) === alvo);
+      if (candidatos.length === 1) return { match: candidatos[0], ambiguo: false, candidatos: [] };
+      if (candidatos.length > 1) return { match: null, ambiguo: true, candidatos };
+    }
+  }
+  return { match: null, ambiguo: false, candidatos: [] };
+}
+
+// Cria o cadastro mínimo em "usuarios" quando a busca acima não acha
+// ninguém — só chamada quando JÁ TEM e-mail de verdade (nunca fabricamos
+// um, ver decisão registrada: e-mail inventado geraria duplicata de
+// verdade quando a pessoa se cadastrar depois). upsert com onConflict:
+// 'email' — MESMO padrão que o próprio app usa no cadastro real (App.jsx,
+// handleLoginComplete/CadastroEmpresaScreen) — se essa pessoa se cadastrar
+// de verdade depois com o mesmo e-mail, cai na MESMA linha, não duplica.
+// categoria_servico: ['pendente'] é obrigatório aqui — existe uma CHECK
+// constraint real (categoria_servico_obrigatoria_para_professional) que
+// rejeita role='professional' sem categoria (já quebrou aprovação real de
+// profissional antes — ver memória do projeto, casos Fábio/Junior/Adilson/
+// reformasmeplan).
+async function criarCadastroMinimoProfissional({ email, nome, telefone }) {
+  const payload = {
+    email: email.trim().toLowerCase(),
+    name: (nome && nome.trim()) || email.split('@')[0],
+    role: 'professional',
+    categoria_servico: ['pendente'],
+    approved: false,
+  };
+  if (telefone) payload.whatsapp = telefone;
+  const { data, error } = await supabase.from('usuarios').upsert(payload, { onConflict: 'email' }).select().maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// Chamada depois que uma demanda (Triagem, Fase 2) vira fila='vendas' —
+// gera o lead no funil automaticamente, sem recadastro manual (item 1 da
+// Fase 3). Idempotente via demanda_id (índice único): se a conversa for
+// encaminhada/devolvida várias vezes, não duplica o lead, só ignora se já
+// existir. Só telefone disponível aqui (demandas_clientes não tem e-mail) —
+// por isso NÃO cria cadastro mínimo neste ponto (exigiria inventar e-mail);
+// se achar um cadastro existente por telefone usa ele, senão o lead nasce
+// sem profissional_email, e a equipe completa o e-mail manualmente quando
+// descobrir na conversa (aí sim roda a criação, via PATCH normal).
+// Best-effort: erro aqui nunca derruba a resposta de /api/admin/demandas,
+// só loga — encaminhar pra vendas não pode falhar por causa disso.
+async function sincronizarVendasPipelineDaDemanda(demandaId) {
+  try {
+    const { data: existente } = await supabase.from('vendas_pipeline').select('id').eq('demanda_id', demandaId).maybeSingle();
+    if (existente) return; // já linkado — idempotente
+    const { data: demanda } = await supabase.from('demandas_clientes').select('*').eq('id', demandaId).maybeSingle();
+    if (!demanda) return;
+    const { match, ambiguo } = await buscarUsuarioExistente({ telefone: demanda.telefone_cliente });
+    const payload = {
+      demanda_id: demandaId,
+      telefone: demanda.telefone_cliente,
+      profissional_email: match ? match.email : null,
+      profissional_nome: match ? match.name : (demanda.nome_cliente || demanda.telefone_cliente || 'Sem nome'),
+      estagio: 'novo_lead',
+      observacoes: ambiguo
+        ? 'Telefone bate com mais de um cadastro em "usuarios" — vincular manualmente.'
+        : (demanda.descricao || null),
+    };
+    const { error } = await supabase.from('vendas_pipeline').insert(payload);
+    if (error) console.error('[vendas-pipeline] sync da triagem falhou:', error.message, { demandaId });
+  } catch (e) {
+    console.error('[vendas-pipeline] sync da triagem falhou (exceção):', e.message, { demandaId });
+  }
+}
+
 app.get('/api/admin/vendas-pipeline', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
     const { data, error } = await supabase.from('vendas_pipeline').select('*').order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
-    const leads = data || [];
+    let leads = data || [];
+
+    // Item 4 da Fase 3: "pagamento_confirmado" não é um estágio que alguém
+    // marca manualmente — sincronizado aqui a cada leitura contra a MESMA
+    // verdade que /api/admin/stats já usa (statusPagamentoAssinatura), pra
+    // nunca divergir do que realmente aconteceu na Asaas. Só AVANÇA pro
+    // estágio (nunca volta sozinho se a assinatura vencer depois — a
+    // automação de SAIR do funil é a Fase 4, aqui só garante que o estágio
+    // reflete a realidade quando o pagamento é confirmado).
+    const emails = [...new Set(leads.map(l => l.profissional_email).filter(Boolean).map(e => e.toLowerCase()))];
+    if (emails.length) {
+      const { data: assinaturas } = await supabase
+        .from('assinaturas')
+        .select('titular_email,status,proxima_cobranca,asaas_customer_id,cortesia')
+        .in('titular_email', emails);
+      const pagosPorEmail = new Set(
+        (assinaturas || []).filter(a => statusPagamentoAssinatura(a) === 'pago').map(a => (a.titular_email || '').toLowerCase())
+      );
+      const paraAtualizar = leads.filter(l => l.profissional_email && pagosPorEmail.has(l.profissional_email.toLowerCase()) && l.estagio !== 'pagamento_confirmado');
+      for (const l of paraAtualizar) {
+        const { data: atualizado } = await supabase
+          .from('vendas_pipeline')
+          .update({ estagio: 'pagamento_confirmado', atualizado_em: new Date().toISOString() })
+          .eq('id', l.id).select().maybeSingle();
+        if (atualizado) Object.assign(l, atualizado);
+      }
+    }
+
     // Mesmo padrão de suporte_tickets: join manual em crm_equipe (não expor
     // GET /api/admin/equipe, restrito a administrador).
     const ids = [...new Set(leads.map(l => l.responsavel_id).filter(Boolean))];
@@ -4851,36 +4988,69 @@ app.get('/api/admin/vendas-pipeline', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST — "+ Adicionar ao funil" manual (Vendas.jsx). E-mail continua
+// obrigatório aqui (é o formulário onde um humano digita — diferente do
+// automático da Triagem, que só tem telefone). Item 2 da Fase 3: busca
+// cadastro existente por e-mail OU telefone antes de criar, pra não
+// duplicar (mesmo bug corrigido manualmente via SQL pra Julianarosa e
+// Gabriel).
 app.post('/api/admin/vendas-pipeline', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { profissionalEmail, profissionalNome, observacoes } = req.body || {};
+    const { profissionalEmail, profissionalNome, telefone, observacoes } = req.body || {};
     if (!profissionalEmail || !String(profissionalEmail).trim() || !profissionalNome || !String(profissionalNome).trim()) {
       return res.status(400).json({ error: 'profissionalEmail e profissionalNome são obrigatórios' });
     }
+    const emailDigitado = profissionalEmail.trim();
+    const { match, ambiguo, candidatos } = await buscarUsuarioExistente({ email: emailDigitado, telefone });
+    if (ambiguo) {
+      return res.status(409).json({
+        error: 'Telefone bate com mais de um cadastro existente — confirme o e-mail certo antes de adicionar.',
+        candidatos: candidatos.map(c => ({ email: c.email, nome: c.name })),
+      });
+    }
+    // Cadastro encontrado (por e-mail exato OU pelo telefone informado)?
+    // Usa o e-mail/nome REAIS do cadastro existente, não confia no que foi
+    // digitado — evita duplicar caso o e-mail informado tenha erro de
+    // digitação mas o telefone bata com um cadastro já existente.
+    let emailFinal = emailDigitado.toLowerCase();
+    let nomeFinal = profissionalNome.trim();
+    let origemMatch = 'novo';
+    if (match) {
+      emailFinal = match.email;
+      nomeFinal = match.name || nomeFinal;
+      origemMatch = 'existente';
+    } else {
+      await criarCadastroMinimoProfissional({ email: emailDigitado, nome: profissionalNome, telefone });
+    }
+
+    // Ainda não tem lead pra esse e-mail no funil? Evita duplicar clique
+    // duplo/reentrada do mesmo profissional.
+    const { data: leadExistente } = await supabase
+      .from('vendas_pipeline').select('*').ilike('profissional_email', emailFinal).maybeSingle();
+    if (leadExistente) return res.json({ lead: leadExistente, origemMatch: 'ja_no_funil' });
+
     const payload = {
-      profissional_email: profissionalEmail.trim(),
-      profissional_nome: profissionalNome.trim(),
-      estagio: 'contato_feito',
-      // Quem adiciona já entra como responsável — não fica sem dono à toa;
-      // pode ser reatribuído depois via PATCH. null pra quem loga com o
-      // token antigo (sem userId).
+      profissional_email: emailFinal,
+      profissional_nome: nomeFinal,
+      telefone: telefone ? String(telefone).trim() : null,
+      estagio: 'contato_feito', // adicionado manualmente pressupõe que o contato já foi feito
       responsavel_id: req.adminAuth?.userId || null,
       observacoes: observacoes ? String(observacoes).trim() : null,
     };
     const { data, error } = await supabase.from('vendas_pipeline').insert(payload).select().maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ lead: data });
+    res.json({ lead: data, origemMatch });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/admin/vendas-pipeline/:id', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
-    const { estagio, responsavelId, observacoes } = req.body || {};
+    const { estagio, responsavelId, observacoes, profissionalEmail } = req.body || {};
     const updates = { atualizado_em: new Date().toISOString() };
     if (estagio !== undefined) {
-      if (!['contato_feito', 'documentos_pendentes', 'pagamento_pendente', 'ativo'].includes(estagio)) {
+      if (!VENDAS_ESTAGIOS.includes(estagio)) {
         return res.status(400).json({ error: 'Estágio inválido' });
       }
       updates.estagio = estagio;
@@ -4892,6 +5062,27 @@ app.patch('/api/admin/vendas-pipeline/:id', async (req, res) => {
       if (estagio === 'ativo') {
         const { data: atual } = await supabase.from('vendas_pipeline').select('estagio').eq('id', req.params.id).maybeSingle();
         if (atual?.estagio !== 'ativo') updates.ativo_em = new Date().toISOString();
+      }
+    }
+    // Fase 3: completar o e-mail de um lead que nasceu só com telefone
+    // (veio da Triagem, ninguém achou cadastro por telefone ainda) — roda
+    // a MESMA busca/criação do POST manual, pra não duplicar aqui também.
+    if (profissionalEmail !== undefined && profissionalEmail && String(profissionalEmail).trim()) {
+      const emailDigitado = profissionalEmail.trim();
+      const { match, ambiguo, candidatos } = await buscarUsuarioExistente({ email: emailDigitado });
+      if (ambiguo) {
+        return res.status(409).json({
+          error: 'Telefone bate com mais de um cadastro existente — confirme o e-mail certo.',
+          candidatos: candidatos.map(c => ({ email: c.email, nome: c.name })),
+        });
+      }
+      if (match) {
+        updates.profissional_email = match.email;
+        if (match.name) updates.profissional_nome = match.name;
+      } else {
+        const { data: atualLead } = await supabase.from('vendas_pipeline').select('profissional_nome,telefone').eq('id', req.params.id).maybeSingle();
+        await criarCadastroMinimoProfissional({ email: emailDigitado, nome: atualLead?.profissional_nome, telefone: atualLead?.telefone });
+        updates.profissional_email = emailDigitado.toLowerCase();
       }
     }
     if (responsavelId !== undefined) updates.responsavel_id = responsavelId || null;
