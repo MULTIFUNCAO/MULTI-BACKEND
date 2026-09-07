@@ -4830,6 +4830,72 @@ app.get('/api/admin/triagem-metricas', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── NORMALIZAÇÃO DE CATEGORIA (paliativo enquanto a limpeza real do dado
+// não sai — decisão 2026-09-07, pré-requisito bloqueante pra "view reversa
+// Profissional → Demandas" fica em espera até essa limpeza definitiva
+// existir) ─────────────────────────────────────────────────────────────
+// Confirmado por query direta em produção: categoria_servico (array em
+// usuarios/profissionais_externos, texto livre — às vezes com VÁRIAS
+// categorias numa string só separada por vírgula — em
+// demandas_clientes) tem grafia fragmentada de verdade: "montador" /
+// "montador_de_moveis" / "montador_moveis" coexistindo, "eletricista" /
+// "Eletricista", sinônimos soltos ("hidráulica", "gás", "reparo de
+// gesso", "tv", "redes", "faxineira"), e até nome de GRUPO vazado pro
+// campo de categoria ("Climatização", "Elétrica e Automação", "Limpeza").
+// Isso fazia o match falhar mesmo quando as duas pontas queriam dizer a
+// mesma coisa (caso real reportado: Diney). Normaliza só NA LEITURA —
+// nenhum UPDATE em usuarios/profissionais_externos/demandas_clientes, o
+// dado bruto continua como está até a limpeza de verdade rodar.
+// Cobre os aliases achados na varredura de 2026-09-07 — não é exaustivo.
+// Nome de GRUPO (Climatização/Elétrica e Automação/Limpeza-como-grupo)
+// fica DE PROPÓSITO sem alias: mapear um grupo genérico pra uma categoria
+// específica seria chute, não normalização — melhor não achar match do
+// que inventar um errado. "limpeza"/"faxineira"/"faxina" têm alias porque
+// aí é claramente diarista, não o grupo inteiro.
+const CATEGORIA_ALIASES = {
+  montador: 'montador_de_moveis',
+  montador_moveis: 'montador_de_moveis',
+  montagem: 'montador_de_moveis',
+  diarista_domestica: 'diarista',
+  faxineira: 'diarista',
+  faxina: 'diarista',
+  limpeza: 'diarista',
+  estofados: 'higienizador_de_estofados',
+  hidraulica: 'encanador',
+  gas: 'vazamento_de_gas',
+  reparo_de_gesso: 'gesseiro',
+  tv: 'instalador_de_tv',
+  redes: 'instalador_de_redes_de_protecao',
+  eletrica: 'eletricista',
+};
+
+function normalizarCategoriaUnica(raw) {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // tira acento (São Paulo -> sao paulo)
+    .replace(/\s+/g, '_');
+  if (!s) return null;
+  return CATEGORIA_ALIASES[s] || s;
+}
+
+// Sempre retorna array normalizado — cobre tanto array (usuarios/
+// profissionais_externos) quanto string única, inclusive string com
+// várias categorias separadas por vírgula (visto em demandas_clientes,
+// ex.: "ELETRICA ,HIDRAULICA, MONTAGEM").
+function normalizarCategorias(raw) {
+  if (!raw) return [];
+  const valores = Array.isArray(raw) ? raw : String(raw).split(',');
+  return [...new Set(valores.map(normalizarCategoriaUnica).filter(Boolean))];
+}
+
+// Duas listas de categoria "combinam" se tiverem pelo menos um id
+// normalizado em comum.
+function categoriasCombinam(a, b) {
+  const setA = new Set(normalizarCategorias(a));
+  return normalizarCategorias(b).some(c => setA.has(c));
+}
+
 // Busca profissionais compatíveis cruzando DUAS fontes — "usuarios" (quem
 // se cadastrou e foi aprovado de verdade no app) e "profissionais_externos"
 // (contato manual da equipe, sem cadastro — ver supabase_profissionais_
@@ -4839,23 +4905,26 @@ app.get('/api/admin/triagem-metricas', async (req, res) => {
 // chamar continua manual, isto aqui só reduz o trabalho de procurar.
 // categoria/regiao são ambos opcionais — filtro parcial já ajuda (ex.: só
 // categoria, pra busca manual sem cidade).
+// Filtro de categoria roda em JS (categoriasCombinam), não em SQL — um
+// .contains() puro exige grafia idêntica nos dois lados, que é
+// exatamente o que não existe hoje (ver bloco de normalização acima).
+// Volume atual (dezenas de profissionais) não justifica filtrar categoria
+// já na query; se a base crescer muito, revisitar.
 async function buscarProfissionaisCompativeis({ categoria, regiao }) {
   let queryUsuarios = supabase
     .from('usuarios')
     .select('email,name,whatsapp,city,categoria_servico')
     .eq('role', 'professional')
     .eq('approved', true);
-  if (categoria) queryUsuarios = queryUsuarios.contains('categoria_servico', [categoria]);
   if (regiao) queryUsuarios = queryUsuarios.ilike('city', `%${regiao}%`);
 
   let queryExternos = supabase
     .from('profissionais_externos')
     .select('id,nome,telefone,cidade,categoria_servico');
-  if (categoria) queryExternos = queryExternos.contains('categoria_servico', [categoria]);
   if (regiao) queryExternos = queryExternos.ilike('cidade', `%${regiao}%`);
 
   const [{ data: usuariosData, error: errU }, { data: externosData, error: errE }] =
-    await Promise.all([queryUsuarios.limit(50), queryExternos.limit(50)]);
+    await Promise.all([queryUsuarios.limit(200), queryExternos.limit(200)]);
   if (errU) throw errU;
   if (errE) throw errE;
 
@@ -4865,7 +4934,9 @@ async function buscarProfissionaisCompativeis({ categoria, regiao }) {
   const daExternos = (externosData || []).map(p => ({
     fonte: 'externo', id: p.id, nome: p.nome, whatsapp: p.telefone, cidade: p.cidade, categorias: p.categoria_servico || [],
   }));
-  return [...daUsuarios, ...daExternos];
+  let todos = [...daUsuarios, ...daExternos];
+  if (categoria) todos = todos.filter(p => categoriasCombinam(categoria, p.categorias));
+  return todos;
 }
 
 // Anota cada profissional da lista com o repasse mais recente pra essa
