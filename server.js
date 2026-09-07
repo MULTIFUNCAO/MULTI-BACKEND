@@ -3760,6 +3760,67 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/professionals/:email/demandas-compativeis — view reversa
+// (Profissional → Demandas, 2026-09-07), espelho do match direto já
+// existente (demandas/:id/profissionais-sugeridos). Bloqueada até a
+// normalização de categoria na leitura existir (categoriasCombinam, ver
+// bloco de normalização acima na busca de profissionais) — sem ela, essa
+// view herdaria o mesmo bug do caso Diney (match falhando por grafia
+// fragmentada). Mesma regra de elegibilidade do sentido direto: só
+// profissional approved=true, só demanda realmente aberta (não mostra
+// resolvida/cancelada). Reaproveita demandas_repasses (POST /api/admin/
+// demandas/:id/repasses já existente) — não duplica lógica de repasse,
+// só consulta o que já existe pra essa pessoa específica.
+app.get('/api/admin/professionals/:email/demandas-compativeis', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const email = req.params.email;
+    const { data: pro, error: errPro } = await supabase
+      .from('usuarios').select('email,name,whatsapp,city,categoria_servico,approved')
+      .eq('email', email).maybeSingle();
+    if (errPro) return res.status(500).json({ error: errPro.message });
+    if (!pro) return res.status(404).json({ error: 'Profissional não encontrado' });
+    if (!pro.approved) {
+      return res.json({ demandas: [], aviso: 'Profissional ainda não aprovado — não elegível pra receber demandas.' });
+    }
+    if (!pro.categoria_servico?.length) {
+      return res.json({ demandas: [], aviso: 'Profissional sem categoria definida ainda — nada pra sugerir.' });
+    }
+
+    const { data: todasDemandas, error: errDem } = await supabase
+      .from('demandas_clientes')
+      .select('id,nome_cliente,telefone_cliente,regiao,categoria_servico,descricao,status,criado_em')
+      .eq('fila', 'demanda')
+      .in('status', ['aberta', 'em_andamento', 'aguardando_resposta'])
+      .order('criado_em', { ascending: false })
+      .limit(200);
+    if (errDem) return res.status(500).json({ error: errDem.message });
+
+    // Cidade é "de olho", não filtro rígido (texto livre nos dois lados,
+    // sem normalização de local — ver limitação já registrada) — categoria
+    // (normalizada) decide quem entra na lista, região só ordena quem vem
+    // primeiro. Isso não é scoring, é só destacar o que já é mais provável.
+    const compativeis = (todasDemandas || [])
+      .filter(d => categoriasCombinam(d.categoria_servico, pro.categoria_servico))
+      .map(d => ({ ...d, mesma_regiao: !!(pro.city && d.regiao && d.regiao.toLowerCase().includes(String(pro.city).toLowerCase())) }))
+      .sort((a, b) => (b.mesma_regiao - a.mesma_regiao) || (new Date(b.criado_em) - new Date(a.criado_em)));
+
+    if (!compativeis.length) {
+      return res.json({ demandas: [], aviso: 'Nenhuma demanda em aberto pra essa categoria/região no momento.' });
+    }
+
+    const { data: repasses } = await supabase
+      .from('demandas_repasses').select('demanda_id, criado_em')
+      .eq('profissional_fonte', 'usuarios').eq('profissional_email', email)
+      .in('demanda_id', compativeis.map(d => d.id));
+    const repassePorDemanda = Object.fromEntries((repasses || []).map(r => [r.demanda_id, r.criado_em]));
+
+    res.json({
+      demandas: compativeis.map(d => ({ ...d, repasse: repassePorDemanda[d.id] ? { em: repassePorDemanda[d.id] } : null })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── ADMIN — Extrato de pagamentos de um profissional ──────────────────────
 // 2026-08-13: "assinaturas" só guarda o ESTADO ATUAL (upsert por
 // titular_tipo+titular_email, 1 linha só — toda renovação sobrescreve a
