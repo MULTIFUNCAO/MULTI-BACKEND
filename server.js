@@ -4830,11 +4830,65 @@ app.get('/api/admin/triagem-metricas', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Busca profissionais compatíveis cruzando DUAS fontes — "usuarios" (quem
+// se cadastrou e foi aprovado de verdade no app) e "profissionais_externos"
+// (contato manual da equipe, sem cadastro — ver supabase_profissionais_
+// externos_migration.sql, feature "Match automático de Demanda x
+// Profissional", 2026-09-06). Início simples (contains/ilike), sem
+// geolocalização/distância por design desta fase — a decisão de quem
+// chamar continua manual, isto aqui só reduz o trabalho de procurar.
+// categoria/regiao são ambos opcionais — filtro parcial já ajuda (ex.: só
+// categoria, pra busca manual sem cidade).
+async function buscarProfissionaisCompativeis({ categoria, regiao }) {
+  let queryUsuarios = supabase
+    .from('usuarios')
+    .select('email,name,whatsapp,city,categoria_servico')
+    .eq('role', 'professional')
+    .eq('approved', true);
+  if (categoria) queryUsuarios = queryUsuarios.contains('categoria_servico', [categoria]);
+  if (regiao) queryUsuarios = queryUsuarios.ilike('city', `%${regiao}%`);
+
+  let queryExternos = supabase
+    .from('profissionais_externos')
+    .select('id,nome,telefone,cidade,categoria_servico');
+  if (categoria) queryExternos = queryExternos.contains('categoria_servico', [categoria]);
+  if (regiao) queryExternos = queryExternos.ilike('cidade', `%${regiao}%`);
+
+  const [{ data: usuariosData, error: errU }, { data: externosData, error: errE }] =
+    await Promise.all([queryUsuarios.limit(50), queryExternos.limit(50)]);
+  if (errU) throw errU;
+  if (errE) throw errE;
+
+  const daUsuarios = (usuariosData || []).map(p => ({
+    fonte: 'usuarios', id: p.email, nome: p.name, whatsapp: p.whatsapp, cidade: p.city, categorias: p.categoria_servico || [],
+  }));
+  const daExternos = (externosData || []).map(p => ({
+    fonte: 'externo', id: p.id, nome: p.nome, whatsapp: p.telefone, cidade: p.cidade, categorias: p.categoria_servico || [],
+  }));
+  return [...daUsuarios, ...daExternos];
+}
+
+// Anota cada profissional da lista com o repasse mais recente pra essa
+// demanda (se existir) — pra UI trocar "botão de repassar" por "já
+// repassado em X" sem precisar de uma segunda chamada por linha. Casa por
+// (fonte, id): usuarios usa email, externo usa profissionais_externos.id.
+async function anexarInfoRepasse(demandaId, profissionais) {
+  if (!demandaId || !profissionais.length) return profissionais;
+  const { data: repasses, error } = await supabase
+    .from('demandas_repasses').select('*').eq('demanda_id', demandaId).order('criado_em', { ascending: false });
+  if (error) throw error;
+  return profissionais.map(p => {
+    const repasse = (repasses || []).find(r =>
+      r.profissional_fonte === p.fonte &&
+      (p.fonte === 'usuarios' ? r.profissional_email === p.id : r.profissional_externo_id === p.id)
+    );
+    return { ...p, repasse: repasse ? { em: repasse.criado_em } : null };
+  });
+}
+
 // GET /api/admin/demandas/:id/profissionais-sugeridos — dado o regiao +
-// categoria_servico já gravados na demanda, sugere profissionais aprovados
-// compatíveis. Início simples (contains/ilike), sem geolocalização/distância
-// por design desta fase — a decisão de quem chamar continua manual, isto
-// aqui só reduz o trabalho de procurar.
+// categoria_servico já gravados na demanda, sugere profissionais
+// compatíveis (usuarios aprovados + profissionais_externos).
 app.get('/api/admin/demandas/:id/profissionais-sugeridos', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   try {
@@ -4845,18 +4899,62 @@ app.get('/api/admin/demandas/:id/profissionais-sugeridos', async (req, res) => {
     if (!demanda.regiao && !demanda.categoria_servico) {
       return res.json({ profissionais: [], aviso: 'Demanda sem região nem categoria de serviço definidas — nada pra sugerir ainda.' });
     }
-    let query = supabase
-      .from('usuarios')
-      .select('email,name,whatsapp,city,categoria_servico')
-      .eq('role', 'professional')
-      .eq('approved', true);
-    if (demanda.categoria_servico) query = query.contains('categoria_servico', [demanda.categoria_servico]);
-    if (demanda.regiao) query = query.ilike('city', `%${demanda.regiao}%`);
-    const { data, error } = await query.limit(50);
+    const lista = await buscarProfissionaisCompativeis({ categoria: demanda.categoria_servico, regiao: demanda.regiao });
+    res.json({ profissionais: await anexarInfoRepasse(req.params.id, lista) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/profissionais-busca?categoria=&cidade=&demandaId= — busca
+// manual (item 2b da feature), pra quando a sugestão automática não achar
+// ninguém bom ou a pessoa quiser ver outras opções. Pelo menos um filtro é
+// exigido — sem isso devolveria a base inteira. demandaId é opcional: só
+// serve pra anexar o status de repasse (mesmo formato da rota de sugestão),
+// pra um único botão "repassar" funcionar em ambas as listas na tela.
+app.get('/api/admin/profissionais-busca', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { categoria, cidade, demandaId } = req.query;
+    if (!categoria && !cidade) {
+      return res.status(400).json({ error: 'Informe pelo menos categoria ou cidade pra buscar.' });
+    }
+    const lista = await buscarProfissionaisCompativeis({ categoria, regiao: cidade });
+    res.json({ profissionais: await anexarInfoRepasse(demandaId, lista) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/demandas/:id/repasses — histórico completo (pode ter mais
+// de um repasse pra mesma demanda, ex.: primeiro profissional não respondeu).
+app.get('/api/admin/demandas/:id/repasses', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { data, error } = await supabase
+      .from('demandas_repasses').select('*').eq('demanda_id', req.params.id).order('criado_em', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
-    res.json({
-      profissionais: (data || []).map(p => ({ email: p.email, nome: p.name, whatsapp: p.whatsapp, cidade: p.city, categorias: p.categoria_servico || [] })),
-    });
+    res.json({ repasses: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/demandas/:id/repasses — "marquei que repassei essa
+// demanda pra esse profissional". Sem status de aceite/recusa nesta fase
+// (decisão explícita, ver migration) — só rastreabilidade.
+app.post('/api/admin/demandas/:id/repasses', async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  try {
+    const { fonte, id, nome, whatsapp } = req.body || {};
+    if (!['usuarios', 'externo'].includes(fonte)) return res.status(400).json({ error: 'fonte inválida (use "usuarios" ou "externo")' });
+    if (!id || !nome) return res.status(400).json({ error: 'id e nome do profissional são obrigatórios' });
+    const payload = {
+      demanda_id: req.params.id,
+      profissional_fonte: fonte,
+      profissional_email: fonte === 'usuarios' ? id : null,
+      profissional_externo_id: fonte === 'externo' ? id : null,
+      profissional_nome: nome,
+      profissional_whatsapp: whatsapp || null,
+      repassado_por: req.adminAuth?.userId || null,
+    };
+    const { data, error } = await supabase.from('demandas_repasses').insert(payload).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ repasse: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
