@@ -3800,9 +3800,18 @@ app.get('/api/admin/professionals/:email/demandas-compativeis', async (req, res)
     // sem normalização de local — ver limitação já registrada) — categoria
     // (normalizada) decide quem entra na lista, região só ordena quem vem
     // primeiro. Isso não é scoring, é só destacar o que já é mais provável.
+    // includes() nos dois sentidos: usuarios.city às vezes vem com sufixo
+    // ("São Paulo/SP") que não aparece no regiao mais curto da demanda
+    // ("São Paulo") — só checar city.includes(regiao) perderia esse caso
+    // (achado testando ao vivo: Gabriel/"São Paulo/SP" vs demanda/"São Paulo").
     const compativeis = (todasDemandas || [])
+      .map(d => {
+        const regiaoLower = String(d.regiao || '').toLowerCase();
+        const cityLower = String(pro.city || '').toLowerCase();
+        const mesmaRegiao = !!(regiaoLower && cityLower && (regiaoLower.includes(cityLower) || cityLower.includes(regiaoLower)));
+        return { ...d, mesma_regiao: mesmaRegiao };
+      })
       .filter(d => categoriasCombinam(d.categoria_servico, pro.categoria_servico))
-      .map(d => ({ ...d, mesma_regiao: !!(pro.city && d.regiao && d.regiao.toLowerCase().includes(String(pro.city).toLowerCase())) }))
       .sort((a, b) => (b.mesma_regiao - a.mesma_regiao) || (new Date(b.criado_em) - new Date(a.criado_em)));
 
     if (!compativeis.length) {
