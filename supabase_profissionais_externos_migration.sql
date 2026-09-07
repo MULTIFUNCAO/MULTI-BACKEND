@@ -14,10 +14,22 @@
 --
 -- Cruzamento inicial 2026-09-06: das 53 linhas da planilha real, 17 já
 -- tinham telefone batendo com "usuarios" (16 profissional + 1 cliente) — não
--- entraram aqui, é a mesma pessoa, só teria duplicado. Só as 29 realmente
--- externas (com nome, telefone válido e pelo menos uma categoria mapeada)
--- foram inseridas nesta rodada — 3 ficaram de fora por dado incompleto
--- (telefone quebrado/sem DDD ou sem nome), aguardando confirmação.
+-- entraram aqui, é a mesma pessoa, só teria duplicado. 29 realmente externas
+-- (nome, telefone válido, categoria mapeada) foram inseridas nessa primeira
+-- rodada; 3 ficaram de fora por dado incompleto — 2 delas corrigidas e
+-- inseridas numa 2ª rodada no mesmo dia:
+--   - "Marcio": telefone vinha como "1.1917022982E10" (Excel salvou em
+--     notação científica) — não é perda de dígito, é só formatação; o
+--     valor decimal correto é 11917022982 (DDD 11 + celular de 9 dígitos),
+--     recuperado com parseFloat + toFixed(0), sem arredondamento (o
+--     inteiro cabe inteiro na precisão de double, 11 dígitos).
+--   - "gabriel": telefone vinha sem DDD ("96722-2061", só 9 dígitos).
+--     Cidade/estado da planilha = "São Paulo" pros dois campos → DDD 11
+--     inferido (capital), não confirmado com a pessoa — se um dia
+--     aparecer errado, é o primeiro suspeito.
+--   - A 3ª (telefone "47 9792-1349", categoria "Montador de móveis") segue
+--     de fora — sem nome nenhum na planilha original pra essa linha, não
+--     dá pra inventar. Total após a 2ª rodada: 31 linhas.
 --
 -- categoria_servico é text[] (mesmo formato de usuarios.categoria_servico,
 -- não o text único de demandas_clientes) porque um contato de planilha
