@@ -1448,6 +1448,30 @@ function valorMensalidadeAtual(assinatura, configMonetizacao) {
   return Number(PLANOS_ASSINATURA[assinatura.plano]?.valor || 0);
 }
 
+// Passo de onboarding do profissional (Fase 4 do diagnóstico de estrutura
+// do CRM, "Automação Vendas → Atendimento", item 3) — 5 estados pedidos,
+// derivados só de colunas que já existem em "usuarios" (autonomia_aceita_em,
+// doc_rg_status, approved), sem campo novo, "só organizar a exibição".
+// ACHADO real olhando App.jsx: doc_crim_status/doc_address_status são
+// colunas que existem no schema e o app já LÊ (com fallback "pending"), mas
+// NUNCA são escritas por nenhum fluxo real — só doc_rg_status progride de
+// verdade (frente_enviada → analysis → verified/rejected via
+// /api/admin/documentos/verificar ou approve-professional). Por isso os
+// dois primeiros não entram na conta abaixo: exigir os 3 verificados
+// deixaria "documentação aprovada"/"perfil aprovado" inalcançáveis pra
+// 100% dos profissionais reais.
+// "documentação aprovada" (doc_rg verificado, mas approved ainda false) só
+// é alcançável hoje via /api/admin/documentos/verificar (ferramenta
+// separada, EMAIL_ADMIN_KEY) — o botão único do CRM (approve-professional)
+// seta os dois juntos, pulando esse estado direto pra "perfil aprovado".
+function calcularOnboardingStep(p) {
+  if (p.approved) return 'perfil_aprovado';
+  if (!p.autonomia_aceita_em) return 'cadastro_incompleto';
+  if (p.doc_rg_status === 'verified') return 'documentacao_aprovada';
+  if (p.doc_rg_status === 'frente_enviada' || p.doc_rg_status === 'analysis') return 'documentos_em_analise';
+  return 'documentos_pendentes'; // null (nunca enviou) ou 'rejected' (precisa reenviar) — mesma ação pro profissional: enviar/reenviar doc
+}
+
 // ── CUPONS (mês grátis pra quem divulga a plataforma) ───────────────────────
 // Reutilizável de propósito (mesmo código serve pra N profissionais) — ver
 // supabase_cupons_migration.sql. Só vale pro Multi Autônomo, checado tanto
@@ -3460,7 +3484,7 @@ app.get('/api/admin/professionals', async (req, res) => {
     const { cidade, categoria, status } = req.query;
     let query = supabase
       .from('usuarios')
-      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,role,autonomia_aceita_em,created_at')
+      .select('id,email,name,whatsapp,city,cep,status,pro_plan,categoria_servico,approved,role,autonomia_aceita_em,created_at,doc_rg_status')
       .or('role.eq.professional,autonomia_aceita_em.not.is.null');
     if (cidade) query = query.eq('city', cidade);
     if (categoria) query = query.contains('categoria_servico', [categoria]);
@@ -3597,6 +3621,7 @@ app.get('/api/admin/professionals', async (req, res) => {
         role: p.role,
         categories: p.categoria_servico || [],
         approved: p.approved !== false, // undefined (coluna sumiu por bug de durabilidade) -> fail-open, não trata como reprovado
+        onboardingStep: calcularOnboardingStep(p),
         docRgUrl: docInfo.doc_rg_url || null,
         docRgUrlVerso: docInfo.doc_rg_url_verso || null,
         iaStatus: docInfo.analise_ia_status || null,
@@ -3669,7 +3694,7 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
     const email = req.params.email;
     const { data: pro, error: errPro } = await supabase
       .from('usuarios')
-      .select('email,name,whatsapp,city,cep,categoria_servico,approved,role,created_at')
+      .select('email,name,whatsapp,city,cep,categoria_servico,approved,role,created_at,autonomia_aceita_em,doc_rg_status')
       .eq('email', email)
       .or('role.eq.professional,autonomia_aceita_em.not.is.null')
       .maybeSingle();
@@ -3723,7 +3748,7 @@ app.get('/api/admin/professionals/:email', async (req, res) => {
 
     const concluidos = (pedidos || []).filter(p => p.status === 'concluido');
     res.json({
-      profissional: { ...pro, categories: pro.categoria_servico || [] },
+      profissional: { ...pro, categories: pro.categoria_servico || [], onboardingStep: calcularOnboardingStep(pro) },
       ciclo_financeiro: cicloFinanceiro,
       resumo: {
         pedidos_aceitos: (pedidos || []).length,
