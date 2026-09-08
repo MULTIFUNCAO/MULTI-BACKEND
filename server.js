@@ -1338,8 +1338,29 @@ async function ativarAssinatura({ titularTipo, titularEmail, plano, paymentId, c
     lembrete_pix_enviado_em: null,
   };
   if (plano === "acesso" && valorEntradaTravado !== undefined) upsertPayload.valor_entrada_travado = valorEntradaTravado;
-  const { error } = await supabase.from("assinaturas").upsert(upsertPayload, { onConflict: "titular_tipo,titular_email" });
+  // CORRIGIDO (achado 2026-09-08, investigando o caso Leonardo Moraes/
+  // lc.montagensefretes@gmail.com — ver
+  // multi_lc_montagensefretes_cadastro_travado na memória): faltava
+  // verificar se o upsert realmente afetou alguma linha, só "error" era
+  // checado. Sem isso, se este write caísse no mesmo bug de durabilidade já
+  // documentado várias vezes no projeto (upsert/update sem erro nenhum, mas
+  // 0 linhas afetadas), confirmar-pix/cobrar devolviam {success:true,
+  // status:"ativa"} pro front mesmo com "assinaturas" continuando
+  // "pendente" pra sempre no banco — o pagamento aconteceu de verdade na
+  // Asaas, só não persistiu aqui, e nada nunca sinalizava isso (achado no
+  // caso do Leonardo: categoria_servico/docs gravados por outras chamadas,
+  // mas assinatura nunca saiu de "pendente" mesmo tendo passado pelo
+  // pagamento). Agora lança erro explícito — os dois call sites
+  // (confirmar-pix, cobrar) já capturam isso em try/catch e devolvem 500,
+  // então o front sabe que precisa tentar de novo em vez de achar que deu
+  // tudo certo.
+  const { data, error } = await supabase.from("assinaturas")
+    .upsert(upsertPayload, { onConflict: "titular_tipo,titular_email" })
+    .select("status");
   if (error) throw error;
+  if (!data?.length || data[0].status !== "ativa") {
+    throw new Error(`ativarAssinatura: upsert não afetou nenhuma linha (titular_email=${titularEmail}, plano=${plano}) — possível bug de durabilidade do Supabase`);
+  }
   return { proximaCobranca };
 }
 
